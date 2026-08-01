@@ -20,7 +20,7 @@ use ide_db::{
 use sha2::{Digest as _, Sha256};
 use syntax::{
     AstNode, AstToken, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange,
-    ast::{self, HasVisibility},
+    ast::{self, HasName, HasVisibility},
 };
 
 use crate::navigation_target::{NavigationTarget, UpmappingResult};
@@ -65,6 +65,16 @@ pub struct ReferenceData {
     pub range: FileRange,
     pub is_definition: bool,
     pub role: StaticReferenceRole,
+    pub export: Option<StaticExportData>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticExportData {
+    pub exporter: String,
+    pub alias_id: String,
+    pub alias: String,
+    pub qualified_name: String,
+    pub alias_range: FileRange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +103,8 @@ pub struct TokenStaticData {
     pub local: bool,
     /// Whether this definition is an associated item declared by a trait.
     pub trait_member: bool,
+    /// Whether this definition is a const function whose body is part of its semantic interface.
+    pub const_function: bool,
     // FIXME: Make this have the lifetime of the database.
     pub documentation: Option<Documentation<'static>>,
     pub hover: Option<HoverResult>,
@@ -489,26 +501,17 @@ fn crate_root_key(db: &RootDatabase, krate: Crate, local: bool) -> String {
     let Some(path) = root_path.as_path() else {
         return root_path.to_string();
     };
-    let local_roots = Crate::all(db)
-        .into_iter()
-        .filter(|candidate| candidate.origin(db).is_local())
-        .filter_map(|candidate| {
-            let root_file = candidate.root_file(db);
-            let source_root = db.file_source_root(root_file).source_root_id(db);
-            db.source_root(source_root)
-                .source_root(db)
-                .path_for_file(&root_file)
-                .and_then(|root| root.as_path())
-                .map(|root| normalize_identity_path(root.as_str()))
-        })
-        .collect::<Vec<_>>();
-    if local_roots.len() > 1 {
-        let current = normalize_identity_path(path.as_str());
-        return relative_to_common_root(&current, &local_roots);
-    }
     let cwd = &krate.base().data(db).proc_macro_cwd;
+    if let Some(identity) = &krate.base().extra_data(db).graph_identity {
+        let relative = path
+            .strip_prefix(cwd.as_path())
+            .map(|path| path.as_str().replace('\\', "/"))
+            .unwrap_or_else(|| path.as_str().replace('\\', "/"));
+        return format!("{identity};root={relative}");
+    }
+    let workspace = cwd.file_name().map(str::to_owned).unwrap_or_else(|| "workspace".to_owned());
     if let Some(relative) = path.strip_prefix(cwd.as_path()) {
-        return relative.as_str().replace('\\', "/");
+        return format!("{workspace}/{}", relative.as_str().replace('\\', "/"));
     }
     let mut suffix = path
         .components()
@@ -517,34 +520,18 @@ fn crate_root_key(db: &RootDatabase, krate: Crate, local: bool) -> String {
         .map(|component| component.as_str().to_owned())
         .collect::<Vec<_>>();
     suffix.reverse();
-    suffix.join("/")
-}
-
-fn relative_to_common_root(current: &str, paths: &[String]) -> String {
-    let prefix = common_path_prefix(paths);
-    current.strip_prefix(&prefix).unwrap_or(current).trim_start_matches('/').to_owned()
-}
-
-fn normalize_identity_path(path: &str) -> String {
-    path.replace('\\', "/")
-}
-
-fn common_path_prefix(paths: &[String]) -> String {
-    let Some(first) = paths.first() else {
-        return String::new();
-    };
-    let mut components = first.split('/').collect::<Vec<_>>();
-    for path in &paths[1..] {
-        let candidate = path.split('/').collect::<Vec<_>>();
-        let shared =
-            components.iter().zip(candidate).take_while(|(left, right)| *left == right).count();
-        components.truncate(shared);
-    }
-    if components.is_empty() { String::new() } else { format!("{}/", components.join("/")) }
+    format!("{workspace}/{}", suffix.join("/"))
 }
 
 fn is_effectively_exported(db: &RootDatabase, def: Definition<'_>) -> bool {
     if !matches!(def.visibility(db), Some(hir::Visibility::Public)) {
+        return false;
+    }
+    if let Some(item) = def.as_assoc_item(db)
+        && let AssocItemContainer::Impl(impl_) = item.container(db)
+        && let Some(adt) = impl_.self_ty(db).as_adt()
+        && !matches!(Definition::Adt(adt).visibility(db), Some(hir::Visibility::Public))
+    {
         return false;
     }
     let mut owner = def.enclosing_definition(db);
@@ -555,6 +542,52 @@ fn is_effectively_exported(db: &RootDatabase, def: Definition<'_>) -> bool {
         owner = current.enclosing_definition(db);
     }
     true
+}
+
+fn export_data(
+    db: &RootDatabase,
+    sema: &Semantics<'_, RootDatabase>,
+    current_crate: Option<Crate>,
+    target: Definition<'_>,
+    target_id: &str,
+    file_id: FileId,
+    range: TextRange,
+    scope_node: &SyntaxNode,
+) -> Option<StaticExportData> {
+    let krate = current_crate?;
+    let module = sema.scope(scope_node)?.module();
+    let exporter = stable_id_for_definition(db, sema, krate, module.into());
+    let use_tree = scope_node
+        .ancestors()
+        .filter_map(ast::UseTree::cast)
+        .find(|tree| tree.syntax().text_range().contains_range(range))?;
+    let (alias, alias_range) = if let Some(rename) = use_tree.rename()
+        && let Some(name) = rename.name()
+    {
+        (name.text().to_string(), name.syntax().text_range())
+    } else {
+        (target.name(db)?.display(db, crate::Edition::CURRENT).to_string(), range)
+    };
+    let module_name = qualified_name(
+        def_to_moniker(db, module.into(), krate).as_ref(),
+        module.into(),
+        db,
+        crate::Edition::CURRENT,
+    )
+    .unwrap_or_else(|| krate.display_name(db).map(|name| name.to_string()).unwrap_or_default());
+    let qualified_name =
+        if module_name.is_empty() { alias.clone() } else { format!("{module_name}::{alias}") };
+    let mut alias_id = String::from("rust-export-v1");
+    append_component(&mut alias_id, "exporter", &exporter);
+    append_component(&mut alias_id, "alias", &alias);
+    append_component(&mut alias_id, "target", target_id);
+    Some(StaticExportData {
+        exporter,
+        alias_id,
+        alias,
+        qualified_name,
+        alias_range: FileRange { file_id, range: alias_range },
+    })
 }
 
 fn append_moniker(id: &mut String, moniker: &crate::Moniker) {
@@ -843,6 +876,8 @@ impl<'a> StaticIndex<'a> {
                         && def.as_assoc_item(self.db).is_some_and(|item| {
                             matches!(item.container(self.db), AssocItemContainer::Trait(_))
                         }),
+                    const_function: graph
+                        && matches!(def, Definition::Function(function) if function.is_const(self.db)),
                     documentation: documentation_for_definition(&sema, def, scope_node),
                     hover: Some(hover_for_definition(
                         &sema,
@@ -876,6 +911,20 @@ impl<'a> StaticIndex<'a> {
                 it
             };
             let token = self.tokens.get_mut(id).unwrap();
+            let export = (graph && role == StaticReferenceRole::Export)
+                .then(|| {
+                    export_data(
+                        self.db,
+                        &sema,
+                        current_crate,
+                        def,
+                        &token.stable_id,
+                        file_id,
+                        range,
+                        scope_node,
+                    )
+                })
+                .flatten();
             token.references.push(ReferenceData {
                 range: FileRange { range, file_id },
                 is_definition: match def.try_to_nav(&sema).map(UpmappingResult::call_site) {
@@ -883,6 +932,7 @@ impl<'a> StaticIndex<'a> {
                     None => false,
                 },
                 role,
+                export,
             });
             result.tokens.push((range, id));
         };
@@ -1447,18 +1497,37 @@ pub fn execute() {}
     }
 
     #[test]
-    fn graph_identity_separates_identical_linked_workspace_roots() {
-        let roots =
-            vec!["/workspace/one/src/lib.rs".to_owned(), "/workspace/two/src/lib.rs".to_owned()];
+    fn graph_identity_does_not_change_when_a_local_target_is_added() {
+        fn execute_id(fixture_text: &str) -> String {
+            let (analysis, _) = fixture::annotations_without_marker(fixture_text);
+            StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded)
+                .tokens
+                .iter()
+                .find(|(_, token)| {
+                    token.definition.is_some() && token.display_name.as_deref() == Some("execute")
+                })
+                .unwrap()
+                .1
+                .stable_id
+                .clone()
+        }
 
-        assert_eq!(
-            super::relative_to_common_root("/workspace/one/src/lib.rs", &roots),
-            "one/src/lib.rs"
+        let before = execute_id(
+            r#"
+//- /workspace/src/lib.rs crate:main
+pub fn execute() {}
+"#,
         );
-        assert_eq!(
-            super::relative_to_common_root("/workspace/two/src/lib.rs", &roots),
-            "two/src/lib.rs"
+        let after = execute_id(
+            r#"
+//- /workspace/src/lib.rs crate:main
+pub fn execute() {}
+//- /workspace/src/main.rs crate:bin
+fn main() {}
+"#,
         );
+
+        assert_eq!(before, after);
     }
 
     #[test]
@@ -1504,6 +1573,77 @@ pub use private::hidden as alias;
         assert!(hidden.unwrap().references.iter().any(|reference| {
             !reference.is_definition && reference.role == super::StaticReferenceRole::Export
         }));
+        let export = hidden
+            .unwrap()
+            .references
+            .iter()
+            .find_map(|reference| reference.export.as_ref())
+            .unwrap();
+        assert_eq!(export.alias, "alias");
+        assert!(export.qualified_name.ends_with("::alias"));
+        assert!(export.exporter.starts_with("rust-hir-v1|"));
+        assert!(export.alias_id.starts_with("rust-export-v1|"));
+    }
+
+    #[test]
+    fn graph_does_not_export_public_inherent_items_of_private_types() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- /workspace/lib.rs crate:main
+struct Private;
+impl Private { pub fn hidden() {} }
+pub struct Public;
+impl Public { pub fn exposed() {} }
+"#,
+        );
+        let index = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded);
+        let tokens = index.tokens.iter().map(|(_, token)| token).collect::<Vec<_>>();
+
+        assert!(
+            !tokens
+                .iter()
+                .find(|token| token.display_name.as_deref() == Some("hidden"))
+                .unwrap()
+                .exported
+        );
+        assert!(
+            tokens
+                .iter()
+                .find(|token| token.display_name.as_deref() == Some("exposed"))
+                .unwrap()
+                .exported
+        );
+    }
+
+    #[test]
+    fn graph_marks_const_functions_for_interface_fingerprinting() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- /workspace/lib.rs crate:main
+pub const fn answer() -> u8 { 42 }
+pub fn runtime() -> u8 { 42 }
+"#,
+        );
+        let tokens = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded)
+            .tokens
+            .iter()
+            .map(|(_, token)| token)
+            .collect::<Vec<_>>();
+
+        assert!(
+            tokens
+                .iter()
+                .find(|token| token.display_name.as_deref() == Some("answer"))
+                .unwrap()
+                .const_function
+        );
+        assert!(
+            !tokens
+                .iter()
+                .find(|token| token.display_name.as_deref() == Some("runtime"))
+                .unwrap()
+                .const_function
+        );
     }
 
     #[test]

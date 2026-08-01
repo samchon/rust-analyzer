@@ -1712,6 +1712,10 @@ fn add_target_crate_root(
         proc_macro_cwd,
         crate_ws_data,
     );
+    crate_graph.set_graph_identity(
+        crate_id,
+        Arc::from(format!("cargo-package={};manifest={}", pkg.id, pkg.manifest)),
+    );
     if let TargetKind::Lib { is_proc_macro: true } = kind {
         let proc_macro = match build_data {
             Some((BuildScriptOutput { proc_macro_dylib_path, .. }, has_errors)) => {

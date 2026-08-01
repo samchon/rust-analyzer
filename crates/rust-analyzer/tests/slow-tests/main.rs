@@ -32,7 +32,10 @@ use lsp_types::{
     Range, RenameFilesParams, TextDocumentItem, TextDocumentPositionParams, TypeDefinitionParams,
     TypeDefinitionRequest, WillRenameFilesRequest, WorkDoneProgressParams, WorkspaceSymbolRequest,
 };
-use rust_analyzer::lsp::ext::{OnEnterRequest, RunnablesParams, RunnablesRequest};
+use rust_analyzer::lsp::ext::{
+    GraphSnapshotCheckpoint, GraphSnapshotCheckpointSource, GraphSnapshotParams,
+    GraphSnapshotRequest, GraphSnapshotResult, OnEnterRequest, RunnablesParams, RunnablesRequest,
+};
 use serde_json::json;
 use stdx::format_to_acc;
 
@@ -40,6 +43,121 @@ use test_utils::skip_slow_tests;
 use testdir::TestDir;
 
 use crate::support::{Project, project};
+
+#[test]
+fn graph_snapshot_checkpoint_restores_resident_incremental_state() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    const FIXTURE: &str = r#"
+//- /Cargo.toml
+[package]
+name = "graph-checkpoint"
+version = "0.0.0"
+[dependencies]
+dependency = { path = "dependency" }
+
+//- /src/lib.rs
+pub fn answer() -> u8 { dependency::answer() }
+pub mod nested { pub use super::answer as alias; }
+
+//- /dependency/Cargo.toml
+[package]
+name = "dependency"
+version = "0.0.0"
+
+//- /dependency/src/lib.rs
+pub fn answer() -> u8 { 42 }
+"#;
+    let dir = TestDir::new();
+    let restart_dir = dir.shared();
+    let first_server =
+        Project::with_fixture(FIXTURE).tmp_dir(dir).server().wait_until_workspace_is_loaded();
+    let first: GraphSnapshotResult = serde_json::from_value(
+        first_server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams::default()),
+    )
+    .unwrap();
+    let checkpoint = GraphSnapshotCheckpoint {
+        protocol_version: first.protocol_version,
+        schema_version: first.schema_version,
+        producer: first.producer.clone(),
+        universe: first.universe.digest.clone(),
+        generation: first.generation.clone(),
+        manifest: first.manifest.clone(),
+        sources: first
+            .upserts
+            .iter()
+            .map(|shard| GraphSnapshotCheckpointSource {
+                source: shard.source.clone(),
+                checker_digest: shard.checker_digest.clone(),
+            })
+            .collect(),
+        shards: first.upserts.clone(),
+    };
+    let nodes = first.upserts.iter().flat_map(|shard| &shard.nodes).collect::<Vec<_>>();
+    let edges = first.upserts.iter().flat_map(|shard| &shard.edges).collect::<Vec<_>>();
+    let alias = nodes.iter().find(|node| node.name == "alias").unwrap();
+    assert!(alias.id.starts_with("rust-export-v1|"));
+    assert!(alias.qualified_name.as_deref().unwrap().ends_with("nested::alias"));
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "exports" && edge.to == alias.id && edge.from.starts_with("rust-hir-v1|")
+    }));
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "references" && edge.from == alias.id && edge.to.starts_with("rust-hir-v1|")
+    }));
+    drop(first_server);
+
+    let server = Project::with_fixture(FIXTURE)
+        .tmp_dir(restart_dir)
+        .server()
+        .wait_until_workspace_is_loaded();
+    let restored: GraphSnapshotResult =
+        serde_json::from_value(server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams {
+            known_generation: Some(first.generation.clone()),
+            checkpoint: Some(checkpoint),
+        }))
+        .unwrap();
+    assert!(restored.phases.cache_hit);
+    assert_eq!(restored.generation, first.generation);
+    assert!(restored.upserts.is_empty());
+
+    let resident: GraphSnapshotResult =
+        serde_json::from_value(server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams {
+            known_generation: Some(restored.generation.clone()),
+            checkpoint: None,
+        }))
+        .unwrap();
+    assert!(resident.phases.cache_hit);
+    assert!(resident.upserts.is_empty());
+
+    server.open_file_with_text(
+        "src/lib.rs",
+        "pub fn answer() -> u8 { dependency::answer() + 1 }\npub mod nested { pub use super::answer as alias; }\n"
+            .to_owned(),
+    );
+    let edited: GraphSnapshotResult =
+        serde_json::from_value(server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams {
+            known_generation: Some(restored.generation.clone()),
+            checkpoint: None,
+        }))
+        .unwrap();
+    assert!(!edited.phases.cache_hit);
+    assert_eq!(edited.base_generation.as_deref(), Some(restored.generation.as_str()));
+    assert_eq!(edited.upserts.len(), 1);
+
+    server
+        .open_file_with_text("dependency/src/lib.rs", "pub fn answer() -> u8 { 43 }\n".to_owned());
+    let dependency_changed: GraphSnapshotResult =
+        serde_json::from_value(server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams {
+            known_generation: Some(edited.generation.clone()),
+            checkpoint: None,
+        }))
+        .unwrap();
+    assert_ne!(dependency_changed.universe.digest, edited.universe.digest);
+    assert_eq!(dependency_changed.base_generation, None);
+    assert!(!dependency_changed.upserts.is_empty());
+}
 
 #[test]
 fn completes_items_from_standard_library() {

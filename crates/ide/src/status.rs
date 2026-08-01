@@ -44,7 +44,7 @@ pub(crate) fn status(db: &RootDatabase, file_id: Option<FileId>) -> String {
                 is_proc_macro,
                 proc_macro_cwd,
             } = crate_id.data(db);
-            let ExtraCrateData { version, display_name, potential_cfg_options } =
+            let ExtraCrateData { version, display_name, potential_cfg_options, graph_identity: _ } =
                 crate_id.extra_data(db);
             let cfg_options = crate_id.cfg_options(db);
             let env = crate_id.env(db);

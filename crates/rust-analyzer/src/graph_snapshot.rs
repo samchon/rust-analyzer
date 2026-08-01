@@ -11,13 +11,14 @@ use ide::{
     AssistResolveStrategy, FileId, FileRange, Severity, StaticIndex, StaticReferenceRole,
     StaticRelationKind, SymbolInformationKind, VendoredLibrariesConfig,
 };
-use project_model::ProjectWorkspaceKind;
-use rustc_hash::{FxHashMap, FxHashSet};
+use project_model::{CargoWorkspace, ProjectWorkspaceKind};
+use rustc_hash::FxHashSet;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use syntax::{AstNode, TextRange, ast};
 use toolchain::Tool;
+use walkdir::WalkDir;
 
 use crate::{
     global_state::GlobalStateSnapshot,
@@ -104,6 +105,11 @@ impl GraphSnapshotCache {
         self.full_rebuild = true;
     }
 
+    fn invalidate_universe(&mut self) {
+        self.invalidate_all();
+        self.committed = None;
+    }
+
     pub(crate) fn invalidate_files(&mut self, files: &[FileId]) {
         self.revision = self.revision.wrapping_add(1);
         if self.committed.is_none() {
@@ -139,17 +145,21 @@ pub(crate) fn handle(
     let cached_response = {
         let mut cache = snap.graph_snapshot_cache.lock();
         if cache.committed.as_ref().is_some_and(|cached| cached.universe != observed_universe) {
-            cache.invalidate_all();
+            cache.invalidate_universe();
         }
         cache
             .current()
             .map(|cached| response_plan(cached, params.known_generation.as_deref(), true))
     };
     if let Some(response) = cached_response {
-        return Ok(response.into_result());
+        let mut result = response.into_result();
+        result.phases.total_millis = elapsed_millis(started);
+        return Ok(result);
     }
     if let Some(checkpoint) = params.checkpoint.as_ref() {
-        return checkpoint_response(&snap, &observed_universe, checkpoint, &params);
+        let mut result = checkpoint_response(&snap, &observed_universe, checkpoint, &params)?;
+        result.phases.total_millis = elapsed_millis(started);
+        return Ok(result);
     }
     let (
         revision,
@@ -223,7 +233,7 @@ pub(crate) fn handle(
         }
         cached
     };
-    let shards = build_shards(&snap, index, &snapshot_universe)?;
+    let shards = build_shards(&snap, index, &snapshot_universe, &interface_fingerprints)?;
     let shard_millis = elapsed_millis(shard_started);
 
     let encode_started = Instant::now();
@@ -341,7 +351,7 @@ fn checkpoint_response(
             "persisted graph checkpoint does not match this producer universe; rebuild and retry",
         ));
     }
-    let mut expected_sources =
+    let expected_sources =
         StaticIndex::graph_source_files(&snap.analysis, VendoredLibrariesConfig::Excluded)
             .into_iter()
             .map(|file_id| {
@@ -349,17 +359,13 @@ fn checkpoint_response(
                 let text = snap.analysis.file_text(file_id)?;
                 Ok((source, digest_bytes(text.as_bytes())))
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-    expected_sources.sort();
-    let mut actual_sources = checkpoint
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+    let actual_sources = checkpoint
         .sources
         .iter()
         .map(|source| (source.source.clone(), source.checker_digest.clone()))
-        .collect::<Vec<_>>();
-    actual_sources.sort();
-    let actual_source_count = actual_sources.len();
-    actual_sources.dedup();
-    if actual_sources.len() != actual_source_count || actual_sources != expected_sources {
+        .collect::<BTreeMap<_, _>>();
+    if actual_sources.len() != checkpoint.sources.len() || actual_sources != expected_sources {
         return Err(retry_error(
             "persisted graph checkpoint source manifest moved; rebuild and retry",
         ));
@@ -368,15 +374,44 @@ fn checkpoint_response(
     manifest.sort_by(|left, right| left.key.cmp(&right.key));
     let manifest_count = manifest.len();
     manifest.dedup_by(|left, right| left.key == right.key);
+    let manifest_by_key = manifest
+        .iter()
+        .map(|entry| (entry.key.as_str(), entry.digest.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut shards = BTreeMap::new();
+    let mut interface_fingerprints = BTreeMap::new();
+    for shard in &checkpoint.shards {
+        let expected_key = format!("{}\0{}", snapshot_universe.target, shard.source);
+        let valid = shard.key == expected_key
+            && expected_sources.get(&shard.source) == Some(&shard.checker_digest)
+            && is_digest(&shard.interface_fingerprint)
+            && manifest_by_key.get(shard.key.as_str()).copied() == Some(shard.digest.as_str())
+            && shard_digest(
+                &shard.key,
+                &shard.source,
+                &shard.checker_digest,
+                &shard.interface_fingerprint,
+                &shard.nodes,
+                &shard.edges,
+                &shard.diagnostics,
+                &shard.coverage,
+                &shard.unresolved,
+            )? == shard.digest;
+        if !valid
+            || shards.insert(shard.key.clone(), Arc::new(shard.clone())).is_some()
+            || interface_fingerprints
+                .insert(shard.source.clone(), shard.interface_fingerprint.clone())
+                .is_some()
+        {
+            return Err(retry_error(
+                "persisted graph checkpoint shards are invalid; rebuild and retry",
+            ));
+        }
+    }
     if manifest.len() != manifest_count
         || manifest.len() != expected_sources.len()
-        || !manifest.iter().all(|entry| {
-            entry.digest.len() == 64
-                && entry.digest.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-                && expected_sources.iter().any(|(source, _)| {
-                    entry.key == format!("{}\0{}", snapshot_universe.target, source)
-                })
-        })
+        || checkpoint.shards.len() != expected_sources.len()
+        || !manifest.iter().all(|entry| is_digest(&entry.digest))
         || snapshot_generation(&snapshot_universe.digest, &manifest)? != checkpoint.generation
     {
         return Err(retry_error(
@@ -389,19 +424,34 @@ fn checkpoint_response(
             "graph snapshot universe moved while validating a checkpoint; retry",
         ));
     }
-    Ok(GraphSnapshotResult {
-        protocol_version: PROTOCOL_VERSION,
-        schema_version: SCHEMA_VERSION,
+    let mut cache = snap.graph_snapshot_cache.lock();
+    if let Some(committed) = cache.current() {
+        return Ok(response_plan(committed, params.known_generation.as_deref(), true).into_result());
+    }
+    cache.sequence = cache.sequence.wrapping_add(1);
+    let cached = CachedSnapshot {
+        revision: cache.revision,
         producer: producer(),
         universe: snapshot_universe.clone(),
-        sequence: 1,
+        sequence: cache.sequence,
         generation: checkpoint.generation.clone(),
-        base_generation: Some(checkpoint.generation.clone()),
-        upserts: Vec::new(),
-        deletes: Vec::new(),
         manifest,
         phases: GraphSnapshotPhases { cache_hit: true, ..GraphSnapshotPhases::default() },
-    })
+        shards,
+        interface_fingerprints,
+        delta_base: None,
+        delta_upserts: Vec::new(),
+        delta_deletes: Vec::new(),
+    };
+    let response = response_plan(&cached, params.known_generation.as_deref(), true).into_result();
+    cache.committed = Some(cached);
+    cache.dirty_files.clear();
+    cache.full_rebuild = false;
+    Ok(response)
+}
+
+fn is_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn retry_error(message: &str) -> anyhow::Error {
@@ -411,7 +461,11 @@ fn retry_error(message: &str) -> anyhow::Error {
 
 fn validate_project_model_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<()> {
     for workspace in snap.workspaces.iter() {
-        if !matches!(workspace.kind, ProjectWorkspaceKind::Cargo { .. }) {
+        if !matches!(
+            workspace.kind,
+            ProjectWorkspaceKind::Cargo { .. }
+                | ProjectWorkspaceKind::DetachedFile { cargo: Some(_), .. }
+        ) {
             continue;
         }
         let current = fs::read(workspace.workspace_root().join("Cargo.lock")).ok();
@@ -566,36 +620,25 @@ fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse>
         configurations.extend(workspace.rustc_cfg.iter().map(|cfg| format!("cfg={cfg:?}")));
         configurations.push(format!("cfg-overrides={:?}", workspace.cfg_overrides));
         configurations.push(format!("set-test={}", workspace.set_test));
-        if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind {
+        if let ProjectWorkspaceKind::Cargo { cargo, .. }
+        | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, ..)), .. } = &workspace.kind
+        {
             let cargo_path =
                 workspace.sysroot.tool_path(Tool::Cargo, cargo.workspace_root(), cargo.env());
-            let cargo_env = cargo
-                .env()
-                .into_iter()
-                .map(|(key, value)| (key.clone(), Some(value.clone())))
-                .collect::<FxHashMap<_, _>>();
-            let cargo_version = toolchain::command(&cargo_path, cargo.workspace_root(), &cargo_env)
-                .arg("--version")
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| String::from_utf8(output.stdout).ok())
-                .map(|version| version.trim().to_owned())
-                .unwrap_or_else(|| "unavailable".to_owned());
             let rustc_path =
                 workspace.sysroot.tool_path(Tool::Rustc, cargo.workspace_root(), cargo.env());
-            let rustc_version = toolchain::command(&rustc_path, cargo.workspace_root(), &cargo_env)
-                .arg("-vV")
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| String::from_utf8(output.stdout).ok())
-                .map(|version| version.trim().replace(['\r', '\n'], "|"))
-                .unwrap_or_else(|| "unavailable".to_owned());
             configurations.push(format!("cargo-path={}", normalize_path(cargo_path.as_str())));
-            configurations.push(format!("cargo-version={cargo_version}"));
             configurations.push(format!("rustc-path={}", normalize_path(rustc_path.as_str())));
-            configurations.push(format!("rustc-version={rustc_version}"));
+            configurations.push(format!(
+                "rustc-version={}",
+                workspace
+                    .toolchain
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "unavailable".to_owned())
+            ));
+            configurations
+                .push(format!("path-dependencies-sha256={}", path_dependency_digest(cargo)?));
             for package in cargo.packages() {
                 let package = &cargo[package];
                 let mut features = package.active_features.clone();
@@ -653,6 +696,43 @@ fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse>
     })
 }
 
+fn path_dependency_digest(cargo: &CargoWorkspace) -> anyhow::Result<String> {
+    let mut inputs = Vec::new();
+    for package in cargo.packages() {
+        let package = &cargo[package];
+        if !package.is_local || package.is_member {
+            continue;
+        }
+        let root = package.manifest.parent();
+        let root_path: &std::path::Path = root.as_ref();
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !matches!(entry.file_name().to_str(), Some(".git" | "target")))
+        {
+            let entry = entry.map_err(|error| anyhow::format_err!(error))?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let relative = path.strip_prefix(root_path).unwrap_or(path);
+            inputs.push((
+                format!("{}:{}", package.name, relative.to_string_lossy().replace('\\', "/")),
+                fs::read(path)?,
+            ));
+        }
+    }
+    inputs.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut digest = Sha256::new();
+    for (path, bytes) in inputs {
+        digest.update(path.len().to_le_bytes());
+        digest.update(path.as_bytes());
+        digest.update(bytes.len().to_le_bytes());
+        digest.update(bytes);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 fn cargo_profile(extra_args: &[String]) -> String {
     if extra_args.iter().any(|arg| arg == "--release") {
         return "release".to_owned();
@@ -687,13 +767,14 @@ fn compute_interface_fingerprints(
         {
             let source = source_path(snap, definition.file_id);
             if let Some(source_entries) = entries.get_mut(&source) {
-                let semantic_body = if matches!(
-                    token.kind,
-                    SymbolInformationKind::Constant
-                        | SymbolInformationKind::EnumMember
-                        | SymbolInformationKind::Macro
-                        | SymbolInformationKind::StaticVariable
-                ) {
+                let semantic_body = if token.const_function
+                    || matches!(
+                        token.kind,
+                        SymbolInformationKind::Constant
+                            | SymbolInformationKind::EnumMember
+                            | SymbolInformationKind::Macro
+                            | SymbolInformationKind::StaticVariable
+                    ) {
                     token.definition_body.and_then(|body| {
                         let text = snap.analysis.file_text(body.file_id).ok()?;
                         text.get(usize::from(body.range.start())..usize::from(body.range.end()))
@@ -725,7 +806,14 @@ fn compute_interface_fingerprints(
             let source = source_path(snap, reference.range.file_id);
             if let Some(source_entries) = entries.get_mut(&source) {
                 source_entries.push(canonical_json(&json!({
-                    "import": token.stable_id,
+                    "role": reference_kind(reference.role),
+                    "target": token.stable_id,
+                    "export": reference.export.as_ref().map(|export| json!({
+                        "exporter": export.exporter,
+                        "aliasId": export.alias_id,
+                        "alias": export.alias,
+                        "qualifiedName": export.qualified_name,
+                    })),
                 }))?);
             }
         }
@@ -772,6 +860,7 @@ fn build_shards(
     snap: &GlobalStateSnapshot,
     index: StaticIndex<'_>,
     universe: &GraphSnapshotUniverse,
+    interface_fingerprints: &BTreeMap<String, String>,
 ) -> anyhow::Result<Vec<GraphSnapshotShard>> {
     let files = index.files;
     let relations = index.relations;
@@ -894,6 +983,48 @@ fn build_shards(
             let Some(source) = sources.get(&reference.range.file_id) else {
                 continue;
             };
+            if let Some(export) = &reference.export {
+                shards.get_mut(source).unwrap().nodes.push(GraphSnapshotNode {
+                    id: export.alias_id.clone(),
+                    kind: graph_node_kind(token.kind).to_owned(),
+                    name: export.alias.clone(),
+                    qualified_name: Some(export.qualified_name.clone()),
+                    file: source.clone(),
+                    external: false,
+                    exported: true,
+                    signature: token.signature.clone(),
+                    evidence: evidence(snap, export.alias_range).ok(),
+                });
+                let exports_key = (
+                    export.exporter.clone(),
+                    export.alias_id.clone(),
+                    "exports".to_owned(),
+                    source.clone(),
+                );
+                if edge_keys.insert(exports_key) {
+                    shards.get_mut(source).unwrap().edges.push(GraphSnapshotEdge {
+                        from: export.exporter.clone(),
+                        to: export.alias_id.clone(),
+                        kind: "exports".to_owned(),
+                        evidence: evidence(snap, export.alias_range).ok(),
+                    });
+                }
+                let target_key = (
+                    export.alias_id.clone(),
+                    token.stable_id.clone(),
+                    "references".to_owned(),
+                    source.clone(),
+                );
+                if edge_keys.insert(target_key) {
+                    shards.get_mut(source).unwrap().edges.push(GraphSnapshotEdge {
+                        from: export.alias_id.clone(),
+                        to: token.stable_id.clone(),
+                        kind: "references".to_owned(),
+                        evidence: evidence(snap, reference.range).ok(),
+                    });
+                }
+                continue;
+            }
             let owner = if reference.role == StaticReferenceRole::Export {
                 file_nodes.get(&reference.range.file_id).cloned().unwrap()
             } else {
@@ -1103,10 +1234,15 @@ fn build_shards(
             .get(&shard.source)
             .cloned()
             .ok_or_else(|| anyhow::format_err!("graph shard lost its checker source digest"))?;
+        let interface_fingerprint = interface_fingerprints
+            .get(&shard.source)
+            .cloned()
+            .ok_or_else(|| anyhow::format_err!("graph shard lost its interface fingerprint"))?;
         let digest = shard_digest(
             &key,
             &shard.source,
             &checker_digest,
+            &interface_fingerprint,
             &shard.nodes,
             &shard.edges,
             &shard.diagnostics,
@@ -1117,6 +1253,7 @@ fn build_shards(
             key,
             source: shard.source,
             checker_digest,
+            interface_fingerprint,
             digest,
             nodes: shard.nodes,
             edges: shard.edges,
@@ -1306,6 +1443,7 @@ fn shard_digest(
     key: &str,
     source: &str,
     checker_digest: &str,
+    interface_fingerprint: &str,
     nodes: &[GraphSnapshotNode],
     edges: &[GraphSnapshotEdge],
     diagnostics: &[GraphSnapshotDiagnostic],
@@ -1316,6 +1454,7 @@ fn shard_digest(
         "key": key,
         "source": source,
         "checkerDigest": checker_digest,
+        "interfaceFingerprint": interface_fingerprint,
         "nodes": nodes,
         "edges": edges,
         "diagnostics": diagnostics,
@@ -1417,12 +1556,30 @@ mod tests {
 
     #[test]
     fn shard_identity_includes_the_exact_checker_source_digest() {
-        let left =
-            shard_digest("target\0src/lib.rs", "src/lib.rs", "left", &[], &[], &[], &[], &[])
-                .unwrap();
-        let right =
-            shard_digest("target\0src/lib.rs", "src/lib.rs", "right", &[], &[], &[], &[], &[])
-                .unwrap();
+        let left = shard_digest(
+            "target\0src/lib.rs",
+            "src/lib.rs",
+            "left",
+            "interface",
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let right = shard_digest(
+            "target\0src/lib.rs",
+            "src/lib.rs",
+            "right",
+            "interface",
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
 
         assert_ne!(left, right);
     }
@@ -1433,6 +1590,7 @@ mod tests {
             key: "target\0src/lib.rs".to_owned(),
             source: "src/lib.rs".to_owned(),
             checker_digest: "checker".to_owned(),
+            interface_fingerprint: "interface".to_owned(),
             digest: "digest".to_owned(),
             nodes: Vec::new(),
             edges: Vec::new(),

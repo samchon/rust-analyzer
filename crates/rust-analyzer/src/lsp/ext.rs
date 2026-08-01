@@ -88,6 +88,8 @@ pub struct GraphSnapshotCheckpoint {
     pub generation: String,
     pub manifest: Vec<GraphSnapshotManifestEntry>,
     pub sources: Vec<GraphSnapshotCheckpointSource>,
+    /// Complete, content-addressed producer shards used to restore resident state.
+    pub shards: Vec<GraphSnapshotShard>,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
@@ -145,6 +147,8 @@ pub struct GraphSnapshotShard {
     pub source: String,
     /// SHA-256 of the exact immutable Analysis text used for this shard.
     pub checker_digest: String,
+    /// Digest of the source-owned semantic interface used for rebuild fan-out.
+    pub interface_fingerprint: String,
     pub digest: String,
     pub nodes: Vec<GraphSnapshotNode>,
     pub edges: Vec<GraphSnapshotEdge>,

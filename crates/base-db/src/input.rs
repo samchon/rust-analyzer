@@ -369,7 +369,7 @@ pub type CrateDataBuilder = CrateData<CrateBuilderId>;
 pub type BuiltCrateData = CrateData<Crate>;
 
 /// Crate data unrelated to analysis.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExtraCrateData {
     pub version: Option<String>,
     /// A name used in the package's project declaration: for Cargo projects,
@@ -381,6 +381,18 @@ pub struct ExtraCrateData {
     pub display_name: Option<CrateDisplayName>,
     /// The cfg options that could be used by the crate
     pub potential_cfg_options: Option<CfgOptions>,
+    /// Build-system identity used only by graph-style stable symbol IDs.
+    pub graph_identity: Option<Arc<str>>,
+}
+
+impl fmt::Debug for ExtraCrateData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtraCrateData")
+            .field("version", &self.version)
+            .field("display_name", &self.display_name)
+            .field("potential_cfg_options", &self.potential_cfg_options)
+            .finish()
+    }
 }
 
 #[derive(Default, Clone, PartialEq, Eq)]
@@ -560,11 +572,20 @@ impl CrateGraphBuilder {
                 is_proc_macro,
                 proc_macro_cwd,
             },
-            extra: ExtraCrateData { version, display_name, potential_cfg_options },
+            extra: ExtraCrateData {
+                version,
+                display_name,
+                potential_cfg_options,
+                graph_identity: None,
+            },
             cfg_options,
             env,
             ws_data,
         })
+    }
+
+    pub fn set_graph_identity(&mut self, krate: CrateBuilderId, identity: Arc<str>) {
+        self.arena[krate].extra.graph_identity = Some(identity);
     }
 
     pub fn add_dep(

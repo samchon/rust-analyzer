@@ -501,6 +501,20 @@ impl Server {
             },
         )
     }
+
+    pub(crate) fn open_file_with_text(&self, path: &str, text: String) {
+        fs::write(self.dir.path().join(path), &text).unwrap();
+        self.notification::<lsp_types::DidOpenTextDocumentNotification>(
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: self.doc_id(path).uri,
+                    language_id: lsp_types::LanguageKind::Rust,
+                    version: 1,
+                    text,
+                },
+            },
+        )
+    }
 }
 
 impl Drop for Server {
