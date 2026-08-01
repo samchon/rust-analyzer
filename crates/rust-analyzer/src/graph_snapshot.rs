@@ -2,6 +2,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
@@ -614,7 +616,7 @@ struct ExternalGraphInput {
     root: PathBuf,
 }
 
-fn external_graph_inputs(snap: &GlobalStateSnapshot) -> Vec<ExternalGraphInput> {
+fn external_graph_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<Vec<ExternalGraphInput>> {
     let mut inputs = snap
         .workspaces
         .iter()
@@ -638,11 +640,12 @@ fn external_graph_inputs(snap: &GlobalStateSnapshot) -> Vec<ExternalGraphInput> 
         })
         .collect::<Vec<_>>();
     for workspace in snap.workspaces.iter() {
-        let (rustc_path, cargo_path) = match &workspace.kind {
+        let (rustc_path, cargo_path, environment) = match &workspace.kind {
             ProjectWorkspaceKind::Cargo { cargo, .. }
             | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, ..)), .. } => (
                 workspace.sysroot.tool_path(Tool::Rustc, cargo.workspace_root(), cargo.env()),
                 Some(workspace.sysroot.tool_path(Tool::Cargo, cargo.workspace_root(), cargo.env())),
+                Some(cargo.env()),
             ),
             ProjectWorkspaceKind::Json(_)
             | ProjectWorkspaceKind::DetachedFile { cargo: None, .. } => (
@@ -655,27 +658,22 @@ fn external_graph_inputs(snap: &GlobalStateSnapshot) -> Vec<ExternalGraphInput> 
                     })
                     .unwrap_or_else(|| Tool::Rustc.path()),
                 None,
+                None,
             ),
         };
         let workspace_root: &std::path::Path = workspace.workspace_root().as_ref();
         let rustc_path: &std::path::Path = rustc_path.as_ref();
+        let rustc_path = resolve_external_tool_path(rustc_path, workspace_root, environment)?;
         inputs.push(ExternalGraphInput {
             identity: format!("rustc={}", rustc_path.to_string_lossy()),
-            root: if rustc_path.is_absolute() {
-                rustc_path.to_path_buf()
-            } else {
-                workspace_root.join(rustc_path)
-            },
+            root: rustc_path,
         });
         if let Some(cargo_path) = cargo_path {
             let cargo_path: &std::path::Path = cargo_path.as_ref();
+            let cargo_path = resolve_external_tool_path(cargo_path, workspace_root, environment)?;
             inputs.push(ExternalGraphInput {
                 identity: format!("cargo={}", cargo_path.to_string_lossy()),
-                root: if cargo_path.is_absolute() {
-                    cargo_path.to_path_buf()
-                } else {
-                    workspace_root.join(cargo_path)
-                },
+                root: cargo_path,
             });
         }
         if let Some(root) = workspace.sysroot.rust_lib_src_root() {
@@ -697,7 +695,69 @@ fn external_graph_inputs(snap: &GlobalStateSnapshot) -> Vec<ExternalGraphInput> 
     }
     inputs.sort();
     inputs.dedup();
-    inputs
+    Ok(inputs)
+}
+
+fn resolve_external_tool_path(
+    tool_path: &Path,
+    workspace_root: &Path,
+    environment: Option<&ide_db::base_db::Env>,
+) -> anyhow::Result<PathBuf> {
+    if tool_path.as_os_str().is_empty() {
+        return Err(anyhow::format_err!("external graph tool path is empty"));
+    }
+    if tool_path.is_absolute() {
+        return Ok(tool_path.to_path_buf());
+    }
+    if tool_path.parent().is_some_and(|parent| !parent.as_os_str().is_empty()) {
+        return Ok(workspace_root.join(tool_path));
+    }
+
+    let search_path = environment
+        .and_then(|environment| {
+            environment
+                .into_iter()
+                .find(|(key, _)| {
+                    if cfg!(windows) {
+                        key.eq_ignore_ascii_case("PATH")
+                    } else {
+                        key.as_str() == "PATH"
+                    }
+                })
+                .map(|(_, value)| OsString::from(value))
+        })
+        .or_else(|| env::var_os("PATH"))
+        .ok_or_else(|| {
+            anyhow::format_err!(
+                "external graph tool `{}` is unavailable because PATH is unset",
+                tool_path.display()
+            )
+        })?;
+    env::split_paths(&search_path)
+        .map(|directory| {
+            if directory.as_os_str().is_empty() {
+                workspace_root.to_path_buf()
+            } else if directory.is_absolute() {
+                directory
+            } else {
+                workspace_root.join(directory)
+            }
+        })
+        .find_map(|directory| probe_external_tool(directory.join(tool_path)))
+        .ok_or_else(|| {
+            anyhow::format_err!(
+                "external graph tool `{}` is unavailable on PATH",
+                tool_path.display()
+            )
+        })
+}
+
+fn probe_external_tool(path: PathBuf) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path);
+    }
+    let extension = env::consts::EXE_EXTENSION;
+    (!extension.is_empty()).then(|| path.with_extension(extension)).filter(|path| path.is_file())
 }
 
 fn ensure_external_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<()> {
@@ -721,7 +781,7 @@ fn ensure_external_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<()> {
     let (inputs, held_watcher) = if let Some(inputs) = cached_inputs {
         (inputs, None)
     } else {
-        let inputs = external_graph_inputs(snap);
+        let inputs = external_graph_inputs(snap)?;
         let event_fence = snap.graph_snapshot_cache.lock().external_input_event_fence.clone();
         let watcher = external_input_watcher(
             &event_fence,
@@ -2059,6 +2119,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
+        path::Path,
         sync::Arc,
     };
 
@@ -2073,8 +2134,8 @@ mod tests {
     use super::{
         CachedSnapshot, ExternalGraphInput, GraphSnapshotCache, capture_external_inputs,
         digest_json, drain_external_input_events, ensure_cache_revision,
-        external_input_watch_roots, interfaces_changed, nearest_existing_watch_root, response_for,
-        shard_digest, write_canonical_json,
+        external_input_watch_roots, interfaces_changed, nearest_existing_watch_root,
+        resolve_external_tool_path, response_for, shard_digest, write_canonical_json,
     };
 
     #[test]
@@ -2296,6 +2357,54 @@ mod tests {
         assert_ne!(initial, hidden);
         assert_ne!(hidden, generated);
         assert_ne!(generated, renamed_package);
+    }
+
+    #[test]
+    fn external_tool_paths_preserve_absolute_and_anchor_explicit_relative_paths() {
+        let directory = temp_dir::TempDir::new().unwrap();
+        let workspace = directory.path();
+        let absolute = workspace.join("toolchain/rustc");
+
+        assert_eq!(resolve_external_tool_path(&absolute, workspace, None).unwrap(), absolute,);
+        assert_eq!(
+            resolve_external_tool_path(Path::new("tools/cargo"), workspace, None).unwrap(),
+            workspace.join("tools/cargo"),
+        );
+    }
+
+    #[test]
+    fn external_tool_paths_resolve_bare_commands_from_the_workspace_environment() {
+        let directory = temp_dir::TempDir::new().unwrap();
+        let workspace = directory.path();
+        let bin = workspace.join("toolchain/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let cargo = bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&cargo, "tool").unwrap();
+        let mut environment = ide_db::base_db::Env::default();
+        environment.set("PATH", "toolchain/bin");
+
+        assert_eq!(
+            resolve_external_tool_path(Path::new("cargo"), workspace, Some(&environment)).unwrap(),
+            cargo,
+        );
+    }
+
+    #[test]
+    fn external_tool_paths_fail_closed_for_missing_bare_commands() {
+        let directory = temp_dir::TempDir::new().unwrap();
+        let workspace = directory.path();
+        let mut environment = ide_db::base_db::Env::default();
+        environment.set("PATH", "missing");
+
+        let error = resolve_external_tool_path(
+            Path::new("definitely-missing-rust-tool"),
+            workspace,
+            Some(&environment),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unavailable on PATH"));
+        assert!(!error.to_string().contains(&workspace.display().to_string()));
     }
 
     #[test]
