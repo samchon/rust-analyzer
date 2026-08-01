@@ -35,6 +35,7 @@ use crate::{
 
 const PROTOCOL_VERSION: u32 = 1;
 const SCHEMA_VERSION: u32 = 1;
+const MAX_SYMLINK_HOPS: usize = 64;
 const COVERAGE: [(&str, &str); 15] = [
     ("contains", "partial"),
     ("exports", "partial"),
@@ -939,7 +940,13 @@ fn capture_symlink(
     }
     let target =
         if target.is_absolute() { target } else { link.parent().unwrap_or(&link).join(target) };
-    capture_symlink_target(target, &key, content, watch_roots, &mut BTreeSet::from([link]))
+    capture_symlink_target(
+        target,
+        &key,
+        content,
+        watch_roots,
+        &mut BTreeSet::from([(link, PathBuf::new())]),
+    )
 }
 
 fn capture_symlink_target(
@@ -947,17 +954,22 @@ fn capture_symlink_target(
     key: &[u8],
     content: &mut BTreeMap<Vec<u8>, Vec<u8>>,
     watch_roots: &mut BTreeMap<PathBuf, bool>,
-    seen: &mut BTreeSet<PathBuf>,
+    seen: &mut BTreeSet<(PathBuf, PathBuf)>,
 ) -> anyhow::Result<()> {
+    let mut hops = 0;
     loop {
         match inspect_symlink_path(&target)? {
             SymlinkPath::Link { path, suffix } => {
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return Ok(());
+                }
                 let link = canonical_link_identity(&path);
                 if let Some(parent) = link.parent().filter(|parent| !parent.as_os_str().is_empty())
                 {
                     insert_watch_root(watch_roots, parent.to_path_buf(), false);
                 }
-                if !seen.insert(link.clone()) {
+                if !seen.insert((link.clone(), suffix.clone())) {
                     return Ok(());
                 }
                 let raw_target = fs::read_link(&path)?;
@@ -981,9 +993,7 @@ fn capture_symlink_target(
                 return Ok(());
             }
             SymlinkPath::Missing { path } => {
-                if let Some(root) = nearest_existing_watch_root(path) {
-                    insert_watch_root(watch_roots, root, false);
-                }
+                insert_missing_target_watch_roots(watch_roots, path);
                 return Ok(());
             }
         }
@@ -1019,8 +1029,17 @@ fn inspect_symlink_path(path: &Path) -> anyhow::Result<SymlinkPath> {
                     suffix: components.as_path().to_path_buf(),
                 });
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(metadata) => {
+                if !components.as_path().as_os_str().is_empty() && !metadata.is_dir() {
+                    return Ok(SymlinkPath::Missing { path: path.to_path_buf() });
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
                 return Ok(SymlinkPath::Missing { path: path.to_path_buf() });
             }
             Err(error) => return Err(error.into()),
@@ -1032,6 +1051,14 @@ fn inspect_symlink_path(path: &Path) -> anyhow::Result<SymlinkPath> {
             Ok(SymlinkPath::Missing { path: path.to_path_buf() })
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+fn insert_missing_target_watch_roots(watch_roots: &mut BTreeMap<PathBuf, bool>, target: PathBuf) {
+    let Some(root) = nearest_existing_watch_root(target) else { return };
+    insert_watch_root(watch_roots, root.clone(), false);
+    if let Some(parent) = root.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        insert_watch_root(watch_roots, parent.to_path_buf(), false);
     }
 }
 
@@ -2363,6 +2390,37 @@ mod tests {
         fs::write(real.join("missing.rs"), "pub fn appeared() {}\n").unwrap();
         wait_for_external_event(&fence);
         drop(watcher);
+
+        fs::remove_file(input.join("link")).unwrap();
+        fs::remove_file(outside.join("alias")).unwrap();
+        let deep = outside.join("deep");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("nested.rs"), "pub fn before() {}\n").unwrap();
+        symlink(".", outside.join("repeat")).unwrap();
+        symlink(outside.join("repeat/repeat/deep"), input.join("link")).unwrap();
+        let capture = capture_external_inputs(&inputs).unwrap();
+        assert_eq!(capture.symlink_watch_roots.get(&deep), Some(&true));
+        let fence = Arc::new(StdMutex::new(0));
+        let watcher = external_input_watcher(
+            &fence,
+            external_input_watch_roots(&inputs, &capture.symlink_watch_roots).unwrap(),
+        )
+        .unwrap();
+        fs::write(deep.join("nested.rs"), "pub fn after() {}\n").unwrap();
+        wait_for_external_event(&fence);
+        drop(watcher);
+
+        fs::remove_file(input.join("link")).unwrap();
+        let blocker = outside.join("blocker");
+        fs::write(&blocker, "not a directory").unwrap();
+        symlink(outside.join("blocker/child"), input.join("link")).unwrap();
+        let capture = capture_external_inputs(&inputs).unwrap();
+        assert_eq!(capture.symlink_watch_roots.get(&blocker), Some(&false));
+        assert_eq!(capture.symlink_watch_roots.get(&outside), Some(&false));
+        fs::remove_file(input.join("link")).unwrap();
+        symlink(outside.join("blocker/../deep"), input.join("link")).unwrap();
+        let capture = capture_external_inputs(&inputs).unwrap();
+        assert_ne!(capture.symlink_watch_roots.get(&deep), Some(&true));
 
         fn wait_for_external_event(fence: &Arc<StdMutex<u64>>) {
             for _ in 0..100 {
