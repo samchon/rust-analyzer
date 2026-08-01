@@ -85,8 +85,24 @@ impl GlobalState {
     /// Unlike `is_quiescent`, this returns false when we're indexing
     /// the project, because we're holding the salsa lock and cannot
     /// respond to LSP requests that depend on salsa data.
-    fn is_fully_ready(&self) -> bool {
+    pub(crate) fn is_fully_ready(&self) -> bool {
         self.is_quiescent() && !self.prime_caches_queue.op_in_progress()
+    }
+
+    /// Whether a graph export can observe a settled semantic universe.
+    pub(crate) fn is_graph_snapshot_ready(&self) -> bool {
+        self.is_fully_ready()
+            && !self.incomplete_crate_graph
+            && self.wants_to_switch.is_none()
+            && !self.fetch_workspaces_queue.op_requested()
+            && !self.fetch_build_data_queue.op_requested()
+            && !self.fetch_proc_macros_queue.op_requested()
+            && !self.prime_caches_queue.op_requested()
+            && !self.workspaces.is_empty()
+            && (!self.config.expand_proc_macros()
+                || self.fetch_proc_macros_queue.last_op_result().copied().unwrap_or(false))
+            && (!self.config.run_build_scripts(None)
+                || self.fetch_build_data_queue.last_op_result().is_some())
     }
 
     pub(crate) fn update_configuration(&mut self, config: Config) {
@@ -810,6 +826,7 @@ impl GlobalState {
             }
 
             change.set_crate_graph(crate_graph);
+            self.graph_snapshot_cache.lock().invalidate_all();
             cancellation_time = Some(self.analysis_host.apply_change(change));
             _ = self.finish_loading_crate_graph();
         } else {

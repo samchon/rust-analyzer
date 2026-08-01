@@ -956,6 +956,7 @@ impl GlobalState {
                     ProcMacroProgress::Report(msg) => (Some(Progress::Report), Some(msg)),
                     ProcMacroProgress::End(change) => {
                         self.fetch_proc_macros_queue.op_completed(true);
+                        self.graph_snapshot_cache.lock().invalidate_all();
                         cancellation_time = Some(self.analysis_host.apply_change(change));
                         // FIXME This feels a bit off, this should go through similar machinery as build scripts?
                         _ = self.finish_loading_crate_graph();

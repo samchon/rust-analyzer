@@ -5,7 +5,10 @@ use std::{collections::BTreeSet, fmt::Write as _};
 
 use arrayvec::ArrayVec;
 use either::Either;
-use hir::{AssocItem, Crate, Impl, Module, Semantics, db::HirDatabase};
+use hir::{
+    AsAssocItem, AssocItem, AssocItemContainer, Crate, HirDisplay, Impl, Module, Semantics,
+    db::HirDatabase,
+};
 use ide_db::{
     FileId, FileRange, FxHashMap, FxHashSet, RootDatabase,
     base_db::{SourceDatabase, VfsPath},
@@ -14,6 +17,7 @@ use ide_db::{
     famous_defs::FamousDefs,
     ra_fixture::RaFixtureConfig,
 };
+use sha2::{Digest as _, Sha256};
 use syntax::{AstNode, AstToken, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, ast};
 
 use crate::navigation_target::{NavigationTarget, UpmappingResult};
@@ -35,6 +39,7 @@ pub struct StaticIndex<'a> {
     analysis: &'a Analysis,
     db: &'a RootDatabase,
     def_map: FxHashMap<Definition<'a>, TokenId>,
+    graph: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -50,7 +55,6 @@ pub enum StaticRelationKind {
     Extends,
     Implements,
     Overrides,
-    Dispatches,
 }
 
 #[derive(Debug)]
@@ -159,6 +163,8 @@ pub struct StaticIndexedFile {
     pub file_id: FileId,
     pub folds: Vec<Fold>,
     pub tokens: Vec<(TextRange, TokenId)>,
+    /// The same source file participates in more than one HIR crate/configuration context.
+    pub conditional_build: bool,
 }
 
 fn all_modules(db: &dyn HirDatabase) -> Vec<Module> {
@@ -192,6 +198,7 @@ fn documentation_for_definition(
 fn get_definitions<'db>(
     sema: &Semantics<'db, RootDatabase>,
     token: SyntaxToken,
+    graph: bool,
 ) -> Option<
     ArrayVec<(Definition<'db>, Option<hir::GenericSubstitution<'db>>, StaticReferenceRole), 2>,
 > {
@@ -203,7 +210,12 @@ fn get_definitions<'db>(
             return Some(
                 defs.into_iter()
                     .map(|(def, substitution)| {
-                        (def, substitution, reference_role(sema.db, def, &token))
+                        let role = if graph {
+                            reference_role(sema.db, def, &token)
+                        } else {
+                            StaticReferenceRole::Reference
+                        };
+                        (def, substitution, role)
                     })
                     .collect(),
             );
@@ -224,7 +236,9 @@ fn reference_role(
         match current.kind() {
             SyntaxKind::ATTR => return StaticReferenceRole::Decorate,
             SyntaxKind::USE_TREE => return StaticReferenceRole::Import,
-            SyntaxKind::PATH_TYPE => return StaticReferenceRole::Type,
+            SyntaxKind::PATH_TYPE if is_terminal_path_segment(token) => {
+                return StaticReferenceRole::Type;
+            }
             SyntaxKind::MACRO_CALL if target_kind == SymbolInformationKind::Macro => {
                 return StaticReferenceRole::Call;
             }
@@ -232,21 +246,24 @@ fn reference_role(
                 if matches!(
                     target_kind,
                     SymbolInformationKind::Struct | SymbolInformationKind::EnumMember
-                ) && current.text_range().end() == range.end() =>
+                ) && current.text_range().end() == range.end()
+                    && is_terminal_path_segment(token) =>
             {
                 return StaticReferenceRole::Instantiate;
             }
             SyntaxKind::RECORD_EXPR
                 if ast::RecordExpr::cast(current.clone())
                     .and_then(|expr| expr.path())
-                    .is_some_and(|path| path.syntax().text_range().contains_range(range)) =>
+                    .is_some_and(|path| path.syntax().text_range().contains_range(range))
+                    && is_terminal_path_segment(token) =>
             {
                 return StaticReferenceRole::Instantiate;
             }
             SyntaxKind::CALL_EXPR
                 if ast::CallExpr::cast(current.clone())
                     .and_then(|expr| expr.expr())
-                    .is_some_and(|callee| callee.syntax().text_range().contains_range(range)) =>
+                    .is_some_and(|callee| callee.syntax().text_range().contains_range(range))
+                    && is_terminal_path_segment(token) =>
             {
                 return StaticReferenceRole::Call;
             }
@@ -279,6 +296,17 @@ fn reference_role(
         node = current.parent();
     }
     StaticReferenceRole::Reference
+}
+
+fn is_terminal_path_segment(token: &SyntaxToken) -> bool {
+    let Some(segment) = token.parent_ancestors().find_map(ast::PathSegment::cast) else {
+        return true;
+    };
+    segment
+        .syntax()
+        .parent()
+        .and_then(|path| path.parent())
+        .is_none_or(|parent| parent.kind() != SyntaxKind::PATH)
 }
 
 fn qualified_name(
@@ -316,6 +344,7 @@ fn stable_definition_id(
     moniker: Option<&MonikerResult>,
 ) -> String {
     let mut id = String::from("rust-hir-v1");
+    append_component(&mut id, "crate-context", &crate_context_digest(db, def));
     match moniker {
         Some(MonikerResult::Moniker(moniker)) => append_moniker(&mut id, moniker),
         Some(MonikerResult::Local { enclosing_moniker }) => {
@@ -331,7 +360,111 @@ fn stable_definition_id(
             append_local_identity(&mut id, db, sema, def, nav);
         }
     }
+    append_assoc_identity(&mut id, db, sema, def);
     id
+}
+
+fn append_assoc_identity(
+    id: &mut String,
+    db: &RootDatabase,
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition<'_>,
+) {
+    let Some(item) = def.as_assoc_item(db) else {
+        return;
+    };
+    match item.container(db) {
+        AssocItemContainer::Trait(trait_) => {
+            let krate = trait_.module(db).krate(db);
+            append_component(
+                id,
+                "assoc-owner",
+                &stable_id_for_definition(db, sema, krate, trait_.into()),
+            );
+        }
+        AssocItemContainer::Impl(impl_) => {
+            let module = impl_.module(db);
+            let display_target = module.krate(db).to_display_target(db);
+            append_component(
+                id,
+                "impl-self",
+                &impl_.self_ty(db).display(db, display_target).to_string(),
+            );
+            if let Some(trait_) = impl_.trait_(db) {
+                append_component(
+                    id,
+                    "implemented-trait",
+                    &stable_id_for_definition(db, sema, module.krate(db), trait_.into()),
+                );
+            } else {
+                append_component(id, "implemented-trait", "inherent");
+            }
+        }
+    }
+}
+
+fn crate_context_digest(db: &RootDatabase, def: Definition<'_>) -> String {
+    let Some(krate) = def.krate(db) else {
+        return "builtin".to_owned();
+    };
+    crate_context_digest_for_crate(db, krate)
+}
+
+fn crate_context_digest_for_crate(db: &RootDatabase, krate: Crate) -> String {
+    let origin = krate.origin(db);
+    let root = crate_root_key(db, krate, origin.is_local());
+    let mut dependencies = krate
+        .dependencies(db)
+        .into_iter()
+        .map(|dependency| {
+            format!(
+                "{:?}={:?}@{:?}:{:?}:{}:{:?}",
+                dependency.name,
+                dependency.krate.display_name(db),
+                dependency.krate.version(db),
+                dependency.krate.origin(db),
+                crate_root_key(db, dependency.krate, dependency.krate.origin(db).is_local(),),
+                dependency.krate.cfg(db),
+            )
+        })
+        .collect::<Vec<_>>();
+    dependencies.sort();
+    let context = format!(
+        "root={root};name={:?};version={:?};origin={:?};edition={:?};cfg={:?};dependencies={dependencies:?}",
+        krate.display_name(db),
+        krate.version(db),
+        origin,
+        krate.edition(db),
+        krate.cfg(db),
+    );
+    format!("{:x}", Sha256::digest(context.as_bytes()))
+}
+
+fn crate_root_key(db: &RootDatabase, krate: Crate, local: bool) -> String {
+    if !local {
+        return "dependency".to_owned();
+    }
+    let root_file = krate.root_file(db);
+    let source_root = db.file_source_root(root_file).source_root_id(db);
+    let root_path = db.source_root(source_root).source_root(db).path_for_file(&root_file).cloned();
+    let Some(root_path) = root_path else {
+        return "unavailable".to_owned();
+    };
+    let Some(path) = root_path.as_path() else {
+        return root_path.to_string();
+    };
+    let cwd = &krate.base().data(db).proc_macro_cwd;
+    if let Some(relative) = path.strip_prefix(cwd.as_path()) {
+        return relative.as_str().replace('\\', "/");
+    }
+    let mut suffix = path
+        .components()
+        .rev()
+        .take(3)
+        .map(|component| component.as_str().to_owned())
+        .collect::<Vec<_>>();
+    suffix.reverse();
+    suffix.join("/")
 }
 
 fn append_moniker(id: &mut String, moniker: &crate::Moniker) {
@@ -493,15 +626,6 @@ fn semantic_relations(db: &RootDatabase, files: Option<&FxHashSet<FileId>>) -> V
                     declaration,
                     StaticRelationKind::Overrides,
                 ));
-                relations.insert(relation(
-                    db,
-                    &sema,
-                    krate,
-                    file_id,
-                    declaration,
-                    implementation,
-                    StaticRelationKind::Dispatches,
-                ));
             }
         }
     }
@@ -560,7 +684,13 @@ pub enum VendoredLibrariesConfig<'a> {
 
 impl<'a> StaticIndex<'a> {
     fn add_file(&mut self, file_id: FileId) {
-        let current_crate = crates_for(self.db, file_id).pop().map(Into::into);
+        let graph = self.graph;
+        let crates = crates_for(self.db, file_id);
+        let conditional_build = graph && crates.len() > 1;
+        let current_crate = crates
+            .into_iter()
+            .map(Into::into)
+            .min_by_key(|krate| crate_context_digest_for_crate(self.db, *krate));
         let folds = self.analysis.folding_ranges(file_id, true).unwrap();
         // hovers
         let sema = hir::Semantics::new(self.db);
@@ -587,7 +717,7 @@ impl<'a> StaticIndex<'a> {
             show_drop_glue: true,
             ra_fixture: RaFixtureConfig::default(),
         };
-        let mut result = StaticIndexedFile { file_id, folds, tokens: vec![] };
+        let mut result = StaticIndexedFile { file_id, folds, tokens: vec![], conditional_build };
 
         let mut add_token = |def: Definition<'a>,
                              range: TextRange,
@@ -600,21 +730,23 @@ impl<'a> StaticIndex<'a> {
                 let moniker = current_crate.and_then(|cc| def_to_moniker(self.db, def, cc));
                 let local = matches!(moniker, Some(MonikerResult::Local { .. }));
                 let it = self.tokens.insert(TokenStaticData {
-                    stable_id: stable_definition_id(
-                        self.db,
-                        &sema,
-                        def,
-                        nav.as_ref(),
-                        moniker.as_ref(),
-                    ),
-                    qualified_name: qualified_name(moniker.as_ref(), def, self.db, edition),
-                    exported: matches!(def.visibility(self.db), Some(hir::Visibility::Public)),
-                    external: nav.as_ref().is_some_and(|nav| {
-                        let source_root =
-                            self.db.file_source_root(nav.file_id).source_root_id(self.db);
-                        self.db.source_root(source_root).source_root(self.db).is_library
-                    }),
-                    local,
+                    stable_id: if graph {
+                        stable_definition_id(self.db, &sema, def, nav.as_ref(), moniker.as_ref())
+                    } else {
+                        String::new()
+                    },
+                    qualified_name: graph
+                        .then(|| qualified_name(moniker.as_ref(), def, self.db, edition))
+                        .flatten(),
+                    exported: graph
+                        && matches!(def.visibility(self.db), Some(hir::Visibility::Public)),
+                    external: graph
+                        && nav.as_ref().is_some_and(|nav| {
+                            let source_root =
+                                self.db.file_source_root(nav.file_id).source_root_id(self.db);
+                            self.db.source_root(source_root).source_root(self.db).is_library
+                        }),
+                    local: graph && local,
                     documentation: documentation_for_definition(&sema, def, scope_node),
                     hover: Some(hover_for_definition(
                         &sema,
@@ -668,7 +800,7 @@ impl<'a> StaticIndex<'a> {
         for token in tokens {
             let range = token.text_range();
             let node = token.parent().unwrap();
-            match hir::attach_db(self.db, || get_definitions(&sema, token.clone())) {
+            match hir::attach_db(self.db, || get_definitions(&sema, token.clone(), graph)) {
                 Some(defs) => {
                     for (def, _, role) in defs {
                         add_token(def, range, &node, role);
@@ -683,6 +815,22 @@ impl<'a> StaticIndex<'a> {
     pub fn compute(
         analysis: &'a Analysis,
         vendored_libs_config: VendoredLibrariesConfig<'_>,
+    ) -> StaticIndex<'a> {
+        Self::compute_inner(analysis, vendored_libs_config, false)
+    }
+
+    /// Computes the HIR-enriched graph index used by resident graph snapshots.
+    pub fn compute_graph(
+        analysis: &'a Analysis,
+        vendored_libs_config: VendoredLibrariesConfig<'_>,
+    ) -> StaticIndex<'a> {
+        Self::compute_inner(analysis, vendored_libs_config, true)
+    }
+
+    fn compute_inner(
+        analysis: &'a Analysis,
+        vendored_libs_config: VendoredLibrariesConfig<'_>,
+        graph: bool,
     ) -> StaticIndex<'a> {
         let db = &analysis.db;
         hir::attach_db(db, || {
@@ -707,6 +855,7 @@ impl<'a> StaticIndex<'a> {
                 analysis,
                 db,
                 def_map: Default::default(),
+                graph,
             };
             let mut visited_files = FxHashSet::default();
             for module in work {
@@ -718,7 +867,9 @@ impl<'a> StaticIndex<'a> {
                 this.add_file(file_id);
                 visited_files.insert(file_id);
             }
-            this.relations = semantic_relations(db, None);
+            if graph {
+                this.relations = semantic_relations(db, None);
+            }
             this
         })
     }
@@ -728,7 +879,7 @@ impl<'a> StaticIndex<'a> {
     /// Referenced definitions are still resolved through the same immutable
     /// database revision, so callers can rebuild source-owned shards without
     /// fanning out through LSP requests or walking unrelated files.
-    pub fn compute_files(analysis: &'a Analysis, file_ids: &[FileId]) -> StaticIndex<'a> {
+    pub fn compute_graph_files(analysis: &'a Analysis, file_ids: &[FileId]) -> StaticIndex<'a> {
         let db = &analysis.db;
         hir::attach_db(db, || {
             let mut this = StaticIndex {
@@ -738,6 +889,7 @@ impl<'a> StaticIndex<'a> {
                 analysis,
                 db,
                 def_map: Default::default(),
+                graph: true,
             };
             let mut visited_files = FxHashSet::default();
             for &file_id in file_ids {
@@ -806,6 +958,8 @@ fn is_trailing_trivia(token: &SyntaxToken) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use crate::{StaticIndex, fixture};
     use ide_db::{FileRange, FxHashMap, FxHashSet, base_db::VfsPath};
     use syntax::TextSize;
@@ -814,7 +968,7 @@ mod tests {
 
     fn graph_identities(ra_fixture: &str) -> Vec<(Option<String>, String)> {
         let (analysis, _) = fixture::annotations_without_marker(ra_fixture);
-        let index = StaticIndex::compute(&analysis, VendoredLibrariesConfig::Excluded);
+        let index = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded);
         let mut identities = index
             .tokens
             .iter()
@@ -1132,15 +1286,139 @@ impl Render for Service {
 "#,
         );
         let relations =
-            StaticIndex::compute(&analysis, VendoredLibrariesConfig::Excluded).relations;
+            StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded).relations;
 
         assert!(relations.iter().any(|relation| relation.kind == StaticRelationKind::Extends));
         assert!(relations.iter().any(|relation| relation.kind == StaticRelationKind::Implements));
         assert!(relations.iter().any(|relation| relation.kind == StaticRelationKind::Overrides));
-        assert!(relations.iter().any(|relation| relation.kind == StaticRelationKind::Dispatches));
         assert!(relations.iter().all(|relation| {
             relation.from.starts_with("rust-hir-v1|") && relation.to.starts_with("rust-hir-v1|")
         }));
+    }
+
+    #[test]
+    fn graph_identity_includes_crate_root_context() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- /workspace/one/lib.rs crate:one@1.0.0,https://example.com/shared.git
+pub fn execute() {}
+//- /workspace/two/lib.rs crate:two@1.0.0,https://example.com/shared.git
+pub fn execute() {}
+"#,
+        );
+        let index = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded);
+        let ids = index
+            .tokens
+            .iter()
+            .filter(|(_, token)| {
+                token.definition.is_some() && token.display_name.as_deref() == Some("execute")
+            })
+            .map(|(_, token)| token.stable_id.clone())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(ids.len(), 2, "{ids:#?}");
+        assert!(ids.iter().all(|id| id.contains("crate-context")));
+    }
+
+    #[test]
+    fn graph_identity_separates_inherent_and_trait_methods_with_the_same_name() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- /workspace/lib.rs crate:main
+pub trait First { fn execute(&self); }
+pub trait Second { fn execute(&self); }
+pub struct Service;
+impl Service { pub fn execute(&self) {} }
+impl First for Service { fn execute(&self) {} }
+impl Second for Service { fn execute(&self) {} }
+"#,
+        );
+        let index = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded);
+        let ids = index
+            .tokens
+            .iter()
+            .filter(|(_, token)| {
+                token.definition.is_some() && token.display_name.as_deref() == Some("execute")
+            })
+            .map(|(_, token)| token.stable_id.clone())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(ids.len(), 5, "{ids:#?}");
+        assert!(ids.iter().any(|id| id.contains("implemented-trait")));
+    }
+
+    #[test]
+    fn stock_static_index_avoids_graph_only_enrichment() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- /workspace/lib.rs crate:main
+pub trait Render { fn render(&self); }
+pub struct Service;
+impl Render for Service { fn render(&self) {} }
+pub fn run() { Service.render(); }
+"#,
+        );
+        let index = StaticIndex::compute(&analysis, VendoredLibrariesConfig::Excluded);
+
+        assert!(index.relations.is_empty());
+        assert!(index.tokens.iter_ref().all(|(_, token)| token.stable_id.is_empty()));
+        assert!(
+            index
+                .tokens
+                .iter_ref()
+                .flat_map(|(_, token)| &token.references)
+                .all(|reference| { reference.role == super::StaticReferenceRole::Reference })
+        );
+    }
+
+    #[test]
+    fn graph_reference_roles_do_not_promote_path_qualifiers() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- /workspace/lib.rs crate:main
+pub mod api {
+    pub struct Service;
+    impl Service { pub fn create() -> Self { Self } }
+    pub fn execute() {}
+}
+pub fn run() {
+    api::execute();
+    let _: api::Service = api::Service::create();
+}
+"#,
+        );
+        let index = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded);
+        let roles = |name: &str| {
+            index
+                .tokens
+                .iter_ref()
+                .filter(|(_, token)| token.display_name.as_deref() == Some(name))
+                .flat_map(|(_, token)| token.references.iter().map(|reference| reference.role))
+                .collect::<Vec<_>>()
+        };
+
+        let api_roles = roles("api");
+        assert!(api_roles.iter().all(|role| *role == super::StaticReferenceRole::Reference));
+        assert!(roles("execute").contains(&super::StaticReferenceRole::Call));
+        assert!(roles("Service").contains(&super::StaticReferenceRole::Type));
+        assert!(roles("create").contains(&super::StaticReferenceRole::Call));
+    }
+
+    #[test]
+    fn graph_marks_files_shared_by_multiple_crate_contexts() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- /workspace/one.rs crate:one
+#[path = "shared.rs"] mod shared;
+//- /workspace/two.rs crate:two
+#[path = "shared.rs"] mod shared;
+//- /workspace/shared.rs
+pub fn shared() {}
+"#,
+        );
+        let index = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded);
+
+        assert!(index.files.iter().any(|file| file.conditional_build));
     }
 
     #[test]
@@ -1157,7 +1435,7 @@ impl Render for Service { fn render(&self) {} }
 pub fn run() { invoke!(Service.render()); }
 "#,
         );
-        let index = StaticIndex::compute(&analysis, VendoredLibrariesConfig::Excluded);
+        let index = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded);
         let mut service_is_constructed = false;
         let mut render_is_called = false;
         for (_, token) in index.tokens.iter() {

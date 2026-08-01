@@ -548,6 +548,7 @@ impl GlobalState {
             } else {
                 // No global or client level config was changed. So we can naively replace config.
                 self.config = Arc::new(config);
+                self.graph_snapshot_cache.lock().invalidate_all();
             }
         }
 

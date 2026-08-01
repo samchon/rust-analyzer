@@ -723,6 +723,31 @@ impl ProjectWorkspace {
         }
     }
 
+    /// Deterministic input for consumers that need to fence a serialized
+    /// semantic snapshot to this exact project-model universe.
+    pub fn graph_semantic_descriptor(&self) -> String {
+        let common = (
+            &self.sysroot,
+            &self.rustc_cfg,
+            &self.toolchain,
+            &self.target,
+            &self.cfg_overrides,
+            &self.extra_includes,
+            self.set_test,
+        );
+        match &self.kind {
+            ProjectWorkspaceKind::Cargo { cargo, error, build_scripts, rustc } => {
+                format!("Cargo({common:#?},{cargo:#?},{error:#?},{build_scripts:#?},{rustc:#?})")
+            }
+            ProjectWorkspaceKind::Json(project) => {
+                format!("Json({common:#?},{project:#?})")
+            }
+            ProjectWorkspaceKind::DetachedFile { file, cargo } => {
+                format!("DetachedFile({common:#?},{file:#?},{cargo:#?})")
+            }
+        }
+    }
+
     pub fn manifest(&self) -> Option<&ManifestPath> {
         match &self.kind {
             ProjectWorkspaceKind::Cargo { cargo, .. } => Some(cargo.manifest_path()),

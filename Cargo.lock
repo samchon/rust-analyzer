@@ -1108,6 +1108,7 @@ dependencies = [
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
  "rustc_apfloat",
+ "sha2",
  "smallvec",
  "span",
  "stdx",

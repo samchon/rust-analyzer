@@ -141,7 +141,7 @@ impl RequestDispatcher<'_> {
                 Result: Serialize,
             > + 'static,
     {
-        if !self.global_state.vfs_done || self.global_state.incomplete_crate_graph {
+        if !self.global_state.is_graph_snapshot_ready() {
             if let Some(lsp_server::Request { id, .. }) =
                 self.req.take_if(|it| it.method.as_str() == R::METHOD.as_str())
             {
@@ -171,7 +171,7 @@ impl RequestDispatcher<'_> {
                 self.global_state.respond(lsp_server::Response::new_err(
                     id,
                     lsp_server::ErrorCode::ServerCancelled as i32,
-                    "workspace is still loading; retry the request".to_owned(),
+                    "semantic workspace is still loading; retry the request".to_owned(),
                 ));
             }
             return self;

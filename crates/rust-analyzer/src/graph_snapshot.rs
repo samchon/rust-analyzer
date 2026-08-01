@@ -2,6 +2,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
+    sync::Arc,
     time::Instant,
 };
 
@@ -31,7 +33,7 @@ use crate::{
 const PROTOCOL_VERSION: u32 = 1;
 const SCHEMA_VERSION: u32 = 1;
 const COVERAGE: [(&str, &str); 15] = [
-    ("contains", "complete"),
+    ("contains", "partial"),
     ("exports", "partial"),
     ("imports", "partial"),
     ("calls", "partial"),
@@ -45,7 +47,7 @@ const COVERAGE: [(&str, &str); 15] = [
     ("decorates", "partial"),
     ("renders", "unsupported"),
     ("tests", "partial"),
-    ("references", "complete"),
+    ("references", "partial"),
 ];
 
 pub(crate) struct GraphSnapshotCache {
@@ -68,14 +70,31 @@ impl Default for GraphSnapshotCache {
     }
 }
 
-#[derive(Clone)]
 struct CachedSnapshot {
     revision: u64,
-    full: GraphSnapshotResult,
+    producer: GraphSnapshotProducer,
+    universe: GraphSnapshotUniverse,
+    sequence: u64,
+    generation: String,
+    manifest: Vec<GraphSnapshotManifestEntry>,
+    phases: GraphSnapshotPhases,
+    shards: BTreeMap<String, Arc<GraphSnapshotShard>>,
     interface_fingerprints: BTreeMap<String, String>,
     delta_base: Option<String>,
-    delta_upserts: Vec<GraphSnapshotShard>,
+    delta_upserts: Vec<Arc<GraphSnapshotShard>>,
     delta_deletes: Vec<String>,
+}
+
+struct SnapshotResponsePlan {
+    producer: GraphSnapshotProducer,
+    universe: GraphSnapshotUniverse,
+    sequence: u64,
+    generation: String,
+    base_generation: Option<String>,
+    upserts: Vec<Arc<GraphSnapshotShard>>,
+    deletes: Vec<String>,
+    manifest: Vec<GraphSnapshotManifestEntry>,
+    phases: GraphSnapshotPhases,
 }
 
 impl GraphSnapshotCache {
@@ -96,16 +115,12 @@ impl GraphSnapshotCache {
         }
     }
 
-    fn response(
-        &self,
-        known_generation: Option<&str>,
-        cache_hit: bool,
-    ) -> Option<GraphSnapshotResult> {
+    fn current(&self) -> Option<&CachedSnapshot> {
         let cached = self.committed.as_ref()?;
         if cached.revision != self.revision {
             return None;
         }
-        Some(response_for(cached, known_generation, cache_hit))
+        Some(cached)
     }
 }
 
@@ -114,35 +129,37 @@ pub(crate) fn handle(
     params: GraphSnapshotParams,
 ) -> anyhow::Result<GraphSnapshotResult> {
     if snap.workspaces.is_empty() {
-        anyhow::bail!("graph snapshot is unavailable until the workspace has loaded; retry");
+        return Err(retry_error(
+            "graph snapshot is unavailable until the workspace has loaded; retry",
+        ));
     }
     let started = Instant::now();
+    let cached_response = {
+        let cache = snap.graph_snapshot_cache.lock();
+        cache
+            .current()
+            .map(|cached| response_plan(cached, params.known_generation.as_deref(), true))
+    };
+    if let Some(response) = cached_response {
+        return Ok(response.into_result());
+    }
     let (
         revision,
         dirty_files,
         requested_full_rebuild,
         cached_universe,
         cached_interface_fingerprints,
-        cached_relation_edges,
     ) = {
         let cache = snap.graph_snapshot_cache.lock();
-        if let Some(response) = cache.response(params.known_generation.as_deref(), true) {
-            return Ok(response);
-        }
         (
             cache.revision,
             cache.dirty_files.iter().copied().collect::<Vec<_>>(),
             cache.full_rebuild,
-            cache.committed.as_ref().map(|cached| cached.full.universe.clone()),
+            cache.committed.as_ref().map(|cached| cached.universe.clone()),
             cache
                 .committed
                 .as_ref()
                 .map(|cached| cached.interface_fingerprints.clone())
-                .unwrap_or_default(),
-            cache
-                .committed
-                .as_ref()
-                .map(|cached| relation_edges_by_source(&cached.full))
                 .unwrap_or_default(),
         )
     };
@@ -150,12 +167,14 @@ pub(crate) fn handle(
     let semantic_started = Instant::now();
     let mut full_rebuild = requested_full_rebuild;
     let mut index = if full_rebuild {
-        StaticIndex::compute(&snap.analysis, VendoredLibrariesConfig::Excluded)
+        StaticIndex::compute_graph(&snap.analysis, VendoredLibrariesConfig::Excluded)
     } else {
-        StaticIndex::compute_files(&snap.analysis, &dirty_files)
+        StaticIndex::compute_graph_files(&snap.analysis, &dirty_files)
     };
     if full_rebuild && index.files.is_empty() {
-        anyhow::bail!("graph snapshot is unavailable until the crate graph has loaded; retry");
+        return Err(retry_error(
+            "graph snapshot is unavailable until the crate graph has loaded; retry",
+        ));
     }
     let mut interface_fingerprints = compute_interface_fingerprints(&snap, &index)?;
     if !full_rebuild {
@@ -167,71 +186,81 @@ pub(crate) fn handle(
             &dirty_sources,
         ) {
             full_rebuild = true;
-            index = StaticIndex::compute(&snap.analysis, VendoredLibrariesConfig::Excluded);
+            index = StaticIndex::compute_graph(&snap.analysis, VendoredLibrariesConfig::Excluded);
             if index.files.is_empty() {
-                anyhow::bail!(
-                    "graph snapshot is unavailable while the crate graph is reloading; retry"
-                );
+                return Err(retry_error(
+                    "graph snapshot is unavailable while the crate graph is reloading; retry",
+                ));
             }
             interface_fingerprints = compute_interface_fingerprints(&snap, &index)?;
+        } else {
+            let mut merged = cached_interface_fingerprints;
+            for source in &dirty_sources {
+                merged.remove(source);
+            }
+            merged.extend(interface_fingerprints);
+            interface_fingerprints = merged;
         }
     }
     let semantic_millis = elapsed_millis(semantic_started);
 
     let shard_started = Instant::now();
-    let universe = if full_rebuild {
+    let universe = if requested_full_rebuild {
         universe(&snap)?
     } else {
         cached_universe
             .ok_or_else(|| anyhow::format_err!("incremental graph snapshot lost its universe"))?
     };
-    let preserved_relation_edges = (!full_rebuild).then_some(&cached_relation_edges);
-    let mut shards = build_shards(&snap, index, &universe, preserved_relation_edges)?;
+    let shards = build_shards(&snap, index, &universe)?;
     let shard_millis = elapsed_millis(shard_started);
 
     let encode_started = Instant::now();
     let mut cache = snap.graph_snapshot_cache.lock();
     if cache.revision != revision {
-        anyhow::bail!("graph snapshot was invalidated while it was being built; retry the request");
+        return Err(retry_error(
+            "graph snapshot was invalidated while it was being built; retry the request",
+        ));
     }
-    if !full_rebuild {
+    if let Some(committed) = cache.current() {
+        let response = response_plan(committed, params.known_generation.as_deref(), true);
+        drop(cache);
+        return Ok(response.into_result());
+    }
+    let mut merged = if full_rebuild {
+        BTreeMap::new()
+    } else {
         let dirty_sources =
             dirty_files.iter().map(|&file_id| source_path(&snap, file_id)).collect::<BTreeSet<_>>();
-        let mut merged = cache
-            .committed
-            .as_ref()
-            .map(|cached| cached.full.upserts.clone())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|shard| !dirty_sources.contains(&shard.source))
-            .map(|shard| (shard.key.clone(), shard))
-            .collect::<BTreeMap<_, _>>();
-        for shard in shards {
-            merged.insert(shard.key.clone(), shard);
-        }
-        shards = merged.into_values().collect();
+        let mut merged =
+            cache.committed.as_ref().map(|cached| cached.shards.clone()).unwrap_or_default();
+        merged.retain(|_, shard| !dirty_sources.contains(&shard.source));
+        merged
+    };
+    for shard in shards {
+        merged.insert(shard.key.clone(), Arc::new(shard));
     }
 
-    let previous = cache.committed.as_ref().map(|cached| &cached.full);
-    let old_manifest = previous
-        .map(|result| {
-            result
+    let old_manifest = cache
+        .committed
+        .as_ref()
+        .map(|cached| {
+            cached
                 .manifest
                 .iter()
                 .map(|entry| (entry.key.as_str(), entry.digest.as_str()))
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
-    let manifest = shards
-        .iter()
+    let manifest = merged
+        .values()
         .map(|shard| GraphSnapshotManifestEntry {
             key: shard.key.clone(),
             digest: shard.digest.clone(),
         })
         .collect::<Vec<_>>();
     let new_keys = manifest.iter().map(|entry| entry.key.as_str()).collect::<BTreeSet<_>>();
-    let delta_upserts = shards
-        .iter()
+    let delta_upserts = merged
+        .values()
         .filter(|shard| {
             old_manifest.get(shard.key.as_str()).copied() != Some(shard.digest.as_str())
         })
@@ -242,65 +271,101 @@ pub(crate) fn handle(
         .filter(|key| !new_keys.contains(**key))
         .map(|key| (*key).to_owned())
         .collect::<Vec<_>>();
-    let base_generation = previous.map(|result| result.generation.clone());
+    let base_generation = cache.committed.as_ref().map(|cached| cached.generation.clone());
     let generation = snapshot_generation(&universe.digest, &manifest)?;
     cache.sequence = cache.sequence.wrapping_add(1);
     let sequence = cache.sequence;
     let producer = producer();
     let encode_millis = elapsed_millis(encode_started);
-    let full = GraphSnapshotResult {
-        protocol_version: PROTOCOL_VERSION,
-        schema_version: SCHEMA_VERSION,
+    let phases = GraphSnapshotPhases {
+        semantic_millis,
+        shard_millis,
+        encode_millis,
+        total_millis: elapsed_millis(started),
+        cache_hit: false,
+    };
+    let cached = CachedSnapshot {
+        revision,
         producer,
         universe,
         sequence,
         generation,
-        base_generation: None,
-        upserts: shards,
-        deletes: Vec::new(),
         manifest,
-        phases: GraphSnapshotPhases {
-            semantic_millis,
-            shard_millis,
-            encode_millis,
-            total_millis: elapsed_millis(started),
-            cache_hit: false,
-        },
-    };
-    let cached = CachedSnapshot {
-        revision,
-        full,
+        phases,
+        shards: merged,
         interface_fingerprints,
         delta_base: base_generation,
         delta_upserts,
         delta_deletes,
     };
-    let response = response_for(&cached, params.known_generation.as_deref(), false);
+    let response = response_plan(&cached, params.known_generation.as_deref(), false);
     cache.committed = Some(cached);
     cache.dirty_files.clear();
     cache.full_rebuild = false;
-    Ok(response)
+    drop(cache);
+    Ok(response.into_result())
 }
 
+fn retry_error(message: &str) -> anyhow::Error {
+    crate::lsp::LspError::new(lsp_server::ErrorCode::ServerCancelled as i32, message.to_owned())
+        .into()
+}
+
+#[cfg(test)]
 fn response_for(
     cached: &CachedSnapshot,
     known_generation: Option<&str>,
     cache_hit: bool,
 ) -> GraphSnapshotResult {
-    let mut response = cached.full.clone();
-    if cache_hit {
-        response.phases = GraphSnapshotPhases { cache_hit: true, ..GraphSnapshotPhases::default() };
+    response_plan(cached, known_generation, cache_hit).into_result()
+}
+
+fn response_plan(
+    cached: &CachedSnapshot,
+    known_generation: Option<&str>,
+    cache_hit: bool,
+) -> SnapshotResponsePlan {
+    let (base_generation, upserts, deletes) =
+        if known_generation == Some(cached.generation.as_str()) {
+            (Some(cached.generation.clone()), Vec::new(), Vec::new())
+        } else if known_generation == cached.delta_base.as_deref() {
+            (cached.delta_base.clone(), cached.delta_upserts.clone(), cached.delta_deletes.clone())
+        } else {
+            (None, cached.shards.values().cloned().collect(), Vec::new())
+        };
+    SnapshotResponsePlan {
+        producer: cached.producer.clone(),
+        universe: cached.universe.clone(),
+        sequence: cached.sequence,
+        generation: cached.generation.clone(),
+        base_generation,
+        upserts,
+        deletes,
+        manifest: cached.manifest.clone(),
+        phases: if cache_hit {
+            GraphSnapshotPhases { cache_hit: true, ..GraphSnapshotPhases::default() }
+        } else {
+            cached.phases.clone()
+        },
     }
-    if known_generation == Some(response.generation.as_str()) {
-        response.base_generation = Some(response.generation.clone());
-        response.upserts.clear();
-        response.deletes.clear();
-    } else if known_generation == cached.delta_base.as_deref() {
-        response.base_generation = cached.delta_base.clone();
-        response.upserts.clone_from(&cached.delta_upserts);
-        response.deletes.clone_from(&cached.delta_deletes);
+}
+
+impl SnapshotResponsePlan {
+    fn into_result(self) -> GraphSnapshotResult {
+        GraphSnapshotResult {
+            protocol_version: PROTOCOL_VERSION,
+            schema_version: SCHEMA_VERSION,
+            producer: self.producer,
+            universe: self.universe,
+            sequence: self.sequence,
+            generation: self.generation,
+            base_generation: self.base_generation,
+            upserts: self.upserts.into_iter().map(|shard| (*shard).clone()).collect(),
+            deletes: self.deletes,
+            manifest: self.manifest,
+            phases: self.phases,
+        }
     }
-    response
 }
 
 fn producer() -> GraphSnapshotProducer {
@@ -334,8 +399,55 @@ fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse>
     toolchains.sort();
     toolchains.dedup();
 
-    let mut configurations = Vec::new();
+    let cargo_config = snap.config.cargo(None);
+    let profile = cargo_profile(&cargo_config.extra_args);
+    let mut ignored_proc_macros = snap
+        .config
+        .ignored_proc_macros(None)
+        .iter()
+        .map(|(crate_name, macros)| {
+            let mut macros = macros.iter().map(ToString::to_string).collect::<Vec<_>>();
+            macros.sort();
+            (crate_name.to_string(), macros)
+        })
+        .collect::<Vec<_>>();
+    ignored_proc_macros.sort();
+    let mut environment = std::env::vars_os()
+        .map(|(key, value)| format!("{}={}", key.to_string_lossy(), value.to_string_lossy()))
+        .collect::<Vec<_>>();
+    environment.sort();
+
+    let mut configurations = vec![
+        format!("profile={profile}"),
+        format!("cargo-config-sha256={}", digest_bytes(format!("{cargo_config:#?}").as_bytes())),
+        format!("environment-sha256={}", digest_bytes(environment.join("\0").as_bytes())),
+        format!("expand-proc-macros={}", snap.config.expand_proc_macros()),
+        format!("proc-macros-loaded={}", snap.proc_macros_loaded),
+        format!("run-build-scripts={}", snap.config.run_build_scripts(None)),
+        format!(
+            "ignored-proc-macros-sha256={}",
+            digest_bytes(format!("{ignored_proc_macros:?}").as_bytes())
+        ),
+        format!(
+            "proc-macro-server={}",
+            snap.config
+                .proc_macro_srv()
+                .map(|path| normalize_path(path.as_str()))
+                .unwrap_or_else(|| "sysroot-or-unavailable".to_owned())
+        ),
+    ];
     for workspace in snap.workspaces.iter() {
+        configurations.push(format!(
+            "workspace-descriptor-sha256={}",
+            digest_bytes(workspace.graph_semantic_descriptor().as_bytes())
+        ));
+        let lockfile = workspace.workspace_root().join("Cargo.lock");
+        configurations.push(format!(
+            "cargo-lock-sha256={}",
+            fs::read(&lockfile)
+                .map(|contents| digest_bytes(&contents))
+                .unwrap_or_else(|_| "missing".to_owned())
+        ));
         configurations.push(format!("target={:?}", workspace.target));
         configurations.extend(workspace.rustc_cfg.iter().map(|cfg| format!("cfg={cfg:?}")));
         configurations.push(format!("cfg-overrides={:?}", workspace.cfg_overrides));
@@ -356,19 +468,44 @@ fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse>
                 .and_then(|output| String::from_utf8(output.stdout).ok())
                 .map(|version| version.trim().to_owned())
                 .unwrap_or_else(|| "unavailable".to_owned());
+            let rustc_path =
+                workspace.sysroot.tool_path(Tool::Rustc, cargo.workspace_root(), cargo.env());
+            let rustc_version = toolchain::command(&rustc_path, cargo.workspace_root(), &cargo_env)
+                .arg("-vV")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|version| version.trim().replace(['\r', '\n'], "|"))
+                .unwrap_or_else(|| "unavailable".to_owned());
             configurations.push(format!("cargo-path={}", normalize_path(cargo_path.as_str())));
             configurations.push(format!("cargo-version={cargo_version}"));
+            configurations.push(format!("rustc-path={}", normalize_path(rustc_path.as_str())));
+            configurations.push(format!("rustc-version={rustc_version}"));
             for package in cargo.packages() {
                 let package = &cargo[package];
                 let mut features = package.active_features.clone();
                 features.sort();
+                let mut dependencies = package
+                    .dependencies
+                    .iter()
+                    .map(|dependency| {
+                        format!(
+                            "{}:{}:{:?}",
+                            dependency.name, cargo[dependency.pkg].id, dependency.kind
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                dependencies.sort();
                 configurations.push(format!(
-                    "package={}@{};manifest={};edition={:?};features={}",
+                    "package-id={};name={}@{};manifest={};edition={:?};features={};dependencies={}",
+                    package.id,
                     package.name,
                     package.version,
                     normalize_path(&package.manifest.to_string()),
                     package.edition,
-                    features.join(",")
+                    features.join(","),
+                    dependencies.join(",")
                 ));
                 for &target in &package.targets {
                     let target = &cargo[target];
@@ -400,6 +537,23 @@ fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse>
         toolchains,
         configurations,
     })
+}
+
+fn cargo_profile(extra_args: &[String]) -> String {
+    if extra_args.iter().any(|arg| arg == "--release") {
+        return "release".to_owned();
+    }
+    extra_args
+        .windows(2)
+        .find_map(|args| (args[0] == "--profile").then(|| args[1].clone()))
+        .or_else(|| {
+            extra_args.iter().find_map(|arg| arg.strip_prefix("--profile=").map(str::to_owned))
+        })
+        .unwrap_or_else(|| "dev".to_owned())
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn compute_interface_fingerprints(
@@ -480,28 +634,6 @@ fn interfaces_changed(
     dirty_sources.iter().any(|source| cached.get(source) != current.get(source))
 }
 
-fn relation_edges_by_source(
-    snapshot: &GraphSnapshotResult,
-) -> BTreeMap<String, Vec<GraphSnapshotEdge>> {
-    snapshot
-        .upserts
-        .iter()
-        .filter_map(|shard| {
-            let edges = shard
-                .edges
-                .iter()
-                .filter(|edge| is_relation_kind(&edge.kind))
-                .cloned()
-                .collect::<Vec<_>>();
-            (!edges.is_empty()).then(|| (shard.source.clone(), edges))
-        })
-        .collect()
-}
-
-fn is_relation_kind(kind: &str) -> bool {
-    matches!(kind, "extends" | "implements" | "overrides" | "dispatches")
-}
-
 #[derive(Default)]
 struct MutableShard {
     source: String,
@@ -515,12 +647,16 @@ fn build_shards(
     snap: &GlobalStateSnapshot,
     index: StaticIndex<'_>,
     universe: &GraphSnapshotUniverse,
-    preserved_relation_edges: Option<&BTreeMap<String, Vec<GraphSnapshotEdge>>>,
 ) -> anyhow::Result<Vec<GraphSnapshotShard>> {
     let files = index.files;
     let relations = index.relations;
     let tokens = index.tokens.iter().map(|(_, token)| token).collect::<Vec<_>>();
     let mut sources = BTreeMap::<FileId, String>::new();
+    let conditional_files = files
+        .iter()
+        .filter(|file| file.conditional_build)
+        .map(|file| file.file_id)
+        .collect::<BTreeSet<_>>();
     for file in &files {
         sources.insert(file.file_id, source_path(snap, file.file_id));
     }
@@ -572,7 +708,9 @@ fn build_shards(
             external,
             exported: token.exported,
             signature: token.signature.clone(),
-            evidence: definition.and_then(|range| evidence(snap, range).ok()),
+            evidence: (!external)
+                .then(|| definition.and_then(|range| evidence(snap, range).ok()))
+                .flatten(),
         });
         node_present.push(node.is_some());
         node_sources.push(node.as_ref().and_then(|_| owner_sources.first().cloned()));
@@ -654,7 +792,6 @@ fn build_shards(
             StaticRelationKind::Extends => "extends",
             StaticRelationKind::Implements => "implements",
             StaticRelationKind::Overrides => "overrides",
-            StaticRelationKind::Dispatches => "dispatches",
         };
         let key = (relation.from.clone(), relation.to.clone(), kind.to_owned(), source.clone());
         if edge_keys.insert(key) {
@@ -664,20 +801,6 @@ fn build_shards(
                 kind: kind.to_owned(),
                 evidence: None,
             });
-        }
-    }
-
-    if let Some(preserved_relation_edges) = preserved_relation_edges {
-        for (source, edges) in preserved_relation_edges {
-            let Some(shard) = shards.get_mut(source) else {
-                continue;
-            };
-            for edge in edges {
-                let key = (edge.from.clone(), edge.to.clone(), edge.kind.clone(), source.clone());
-                if edge_keys.insert(key) {
-                    shard.edges.push(edge.clone());
-                }
-            }
         }
     }
 
@@ -741,6 +864,20 @@ fn build_shards(
             .unwrap()
             .unresolved
             .extend(collect_unresolved(snap, file_id, &tokens)?);
+        if conditional_files.contains(&file_id) {
+            let range = snap.analysis.parse(file_id)?.syntax().text_range();
+            let position = evidence(snap, FileRange { file_id, range })?;
+            shards.get_mut(source).unwrap().unresolved.extend(
+                COVERAGE.iter().filter(|(_, state)| *state != "unsupported").map(|(family, _)| {
+                    GraphSnapshotUnresolved {
+                        family: (*family).to_owned(),
+                        evidence: position.clone(),
+                        reason: "conditional-build".to_owned(),
+                        candidates: Vec::new(),
+                    }
+                }),
+            );
+        }
     }
 
     let test_attributes = tokens
@@ -924,6 +1061,20 @@ fn collect_unresolved(
     );
 
     let mut unresolved = Vec::new();
+    for token in tokens.iter().filter(|token| token.kind == SymbolInformationKind::TraitMethod) {
+        for reference in token.references.iter().filter(|reference| {
+            !reference.is_definition
+                && reference.range.file_id == file_id
+                && reference.role == StaticReferenceRole::Call
+        }) {
+            unresolved.push(GraphSnapshotUnresolved {
+                family: "dispatches".to_owned(),
+                evidence: evidence(snap, reference.range)?,
+                reason: "dynamic".to_owned(),
+                candidates: Vec::new(),
+            });
+        }
+    }
     for (family, site, reason) in sites {
         if resolved.iter().any(|(range, resolved_family)| {
             *resolved_family == family && site.contains_range(*range)
@@ -1077,14 +1228,17 @@ fn elapsed_millis(started: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
 
     use ide::FileId;
     use serde_json::json;
 
     use crate::lsp_ext::{
         GraphSnapshotCoverage, GraphSnapshotManifestEntry, GraphSnapshotPhases,
-        GraphSnapshotProducer, GraphSnapshotResult, GraphSnapshotShard, GraphSnapshotUniverse,
+        GraphSnapshotProducer, GraphSnapshotShard, GraphSnapshotUniverse,
     };
 
     use super::{
@@ -1121,39 +1275,36 @@ mod tests {
         };
         let cached = CachedSnapshot {
             revision: 3,
-            full: GraphSnapshotResult {
-                protocol_version: 1,
-                schema_version: 1,
-                producer: GraphSnapshotProducer::default(),
-                universe: GraphSnapshotUniverse::default(),
-                sequence: 4,
-                generation: "new".to_owned(),
-                base_generation: None,
-                upserts: vec![shard.clone()],
-                deletes: Vec::new(),
-                manifest: vec![GraphSnapshotManifestEntry {
-                    key: shard.key.clone(),
-                    digest: shard.digest.clone(),
-                }],
-                phases: GraphSnapshotPhases {
-                    semantic_millis: 11,
-                    shard_millis: 12,
-                    encode_millis: 13,
-                    total_millis: 36,
-                    cache_hit: false,
-                },
+            producer: GraphSnapshotProducer::default(),
+            universe: GraphSnapshotUniverse::default(),
+            sequence: 4,
+            generation: "new".to_owned(),
+            manifest: vec![GraphSnapshotManifestEntry {
+                key: shard.key.clone(),
+                digest: shard.digest.clone(),
+            }],
+            phases: GraphSnapshotPhases {
+                semantic_millis: 11,
+                shard_millis: 12,
+                encode_millis: 13,
+                total_millis: 36,
+                cache_hit: false,
             },
+            shards: BTreeMap::from([(shard.key.clone(), Arc::new(shard.clone()))]),
             interface_fingerprints: BTreeMap::new(),
             delta_base: Some("old".to_owned()),
-            delta_upserts: vec![shard],
+            delta_upserts: vec![Arc::new(shard)],
             delta_deletes: vec!["deleted".to_owned()],
         };
+        let shard_arc = cached.shards.values().next().unwrap();
+        let strong_count = Arc::strong_count(shard_arc);
 
         let noop = response_for(&cached, Some("new"), true);
         assert!(noop.upserts.is_empty());
         assert!(noop.deletes.is_empty());
         assert_eq!(noop.base_generation.as_deref(), Some("new"));
         assert!(noop.phases.cache_hit);
+        assert_eq!(Arc::strong_count(shard_arc), strong_count);
 
         let delta = response_for(&cached, Some("old"), false);
         assert_eq!(delta.upserts.len(), 1);
@@ -1174,7 +1325,13 @@ mod tests {
             full_rebuild: false,
             committed: Some(CachedSnapshot {
                 revision: 0,
-                full: GraphSnapshotResult::default(),
+                producer: GraphSnapshotProducer::default(),
+                universe: GraphSnapshotUniverse::default(),
+                sequence: 0,
+                generation: String::new(),
+                manifest: Vec::new(),
+                phases: GraphSnapshotPhases::default(),
+                shards: BTreeMap::new(),
                 interface_fingerprints: BTreeMap::new(),
                 delta_base: None,
                 delta_upserts: Vec::new(),
@@ -1187,7 +1344,7 @@ mod tests {
         cache.invalidate_files(&[file]);
         assert!(!cache.full_rebuild);
         assert!(cache.dirty_files.contains(&file));
-        assert!(cache.response(None, true).is_none());
+        assert!(cache.current().is_none());
 
         cache.invalidate_all();
         assert!(cache.full_rebuild);
