@@ -5,7 +5,7 @@
 use std::thread::Builder;
 use std::{
     collections::{BTreeSet, VecDeque},
-    fmt, fs, iter,
+    env, fmt, fs, iter,
     ops::Deref,
     sync, thread,
 };
@@ -294,6 +294,13 @@ impl ProjectWorkspace {
         progress("querying project metadata".to_owned());
         let config_file =
             CargoConfigFile::load(cargo_toml, extra_env, &sysroot, config_path.as_deref());
+        let graph_cargo_config_inputs = cargo_config_input_paths(
+            workspace_dir,
+            config_path.as_deref(),
+            &[extra_args, metadata_extra_args],
+            extra_env,
+            config_file.as_ref(),
+        );
         let config_file_ = config_file.clone();
         let toolchain_config = QueryConfig::Cargo(&sysroot, cargo_toml, &config_file_);
         let targets =
@@ -478,10 +485,13 @@ impl ProjectWorkspace {
             graph_input(version::rustc_verbose(&sysroot, workspace_dir, extra_env));
         let graph_project_inputs = capture_graph_project_inputs(
             workspace_dir,
-            cargo.packages().filter_map(|package| {
-                let package = &cargo[package];
-                package.is_member.then(|| AbsPathBuf::from(package.manifest.clone()))
-            }),
+            cargo
+                .packages()
+                .filter_map(|package| {
+                    let package = &cargo[package];
+                    package.is_member.then(|| AbsPathBuf::from(package.manifest.clone()))
+                })
+                .chain(graph_cargo_config_inputs),
         );
         Ok(ProjectWorkspace {
             kind: ProjectWorkspaceKind::Cargo {
@@ -571,7 +581,17 @@ impl ProjectWorkspace {
         ));
         let graph_project_inputs = capture_graph_project_inputs(
             project_json.project_root(),
-            project_json.manifest().map(|manifest| AbsPathBuf::from(manifest.clone())),
+            project_json
+                .manifest()
+                .map(|manifest| AbsPathBuf::from(manifest.clone()))
+                .into_iter()
+                .chain(cargo_config_input_paths(
+                    project_json.project_root(),
+                    config.config_path.as_deref(),
+                    &[&config.extra_args, &config.metadata_extra_args],
+                    &config.extra_env,
+                    None,
+                )),
         );
         ProjectWorkspace {
             kind: ProjectWorkspaceKind::Json(project_json),
@@ -604,6 +624,13 @@ impl ProjectWorkspace {
             &config.extra_env,
             &sysroot,
             config.config_path.as_deref(),
+        );
+        let graph_cargo_config_inputs = cargo_config_input_paths(
+            dir,
+            config.config_path.as_deref(),
+            &[&config.extra_args, &config.metadata_extra_args],
+            &config.extra_env,
+            config_file.as_ref(),
         );
         let query_config = QueryConfig::Cargo(&sysroot, detached_file, &config_file);
         let toolchain = version::get(query_config, &config.extra_env).ok().flatten();
@@ -653,7 +680,7 @@ impl ProjectWorkspace {
 
         let graph_rustc_version =
             graph_input(version::rustc_verbose(&sysroot, dir, &config.extra_env));
-        let graph_project_inputs = capture_graph_project_inputs(dir, std::iter::empty());
+        let graph_project_inputs = capture_graph_project_inputs(dir, graph_cargo_config_inputs);
         Ok(ProjectWorkspace {
             kind: ProjectWorkspaceKind::DetachedFile {
                 file: detached_file.to_owned(),
@@ -826,14 +853,18 @@ impl ProjectWorkspace {
     }
 
     pub fn buildfiles(&self) -> Vec<AbsPathBuf> {
-        match &self.kind {
+        let mut files = match &self.kind {
             ProjectWorkspaceKind::Json(project) => project
                 .crates()
                 .filter_map(|(_, krate)| krate.build.as_ref().map(|build| build.build_file.clone()))
                 .map(|build_file| self.workspace_root().join(build_file))
                 .collect(),
             _ => vec![],
-        }
+        };
+        files.extend(self.graph_project_inputs.iter().map(|(path, _)| path.clone()));
+        files.sort();
+        files.dedup();
+        files
     }
 
     pub fn find_sysroot_proc_macro_srv(&self) -> Option<anyhow::Result<AbsPathBuf>> {
@@ -1195,6 +1226,120 @@ fn capture_graph_project_inputs(
             (path, bytes)
         })
         .collect()
+}
+
+fn cargo_config_input_paths(
+    root: &AbsPath,
+    explicit: Option<&AbsPath>,
+    argument_groups: &[&[String]],
+    extra_env: &FxHashMap<String, Option<String>>,
+    discovered: Option<&CargoConfigFile>,
+) -> BTreeSet<AbsPathBuf> {
+    let mut paths = BTreeSet::new();
+    let mut ancestor = Some(root);
+    while let Some(current) = ancestor {
+        paths.insert(current.join(".cargo/config.toml"));
+        paths.insert(current.join(".cargo/config"));
+        ancestor = current.parent();
+    }
+    if let Some(explicit) = explicit {
+        paths.insert(explicit.to_path_buf());
+    }
+    for arguments in argument_groups {
+        let mut arguments = arguments.iter();
+        while let Some(argument) = arguments.next() {
+            let value = if argument == "--config" {
+                arguments.next().map(String::as_str)
+            } else {
+                argument.strip_prefix("--config=")
+            };
+            let Some(value) = value.filter(|value| !value.contains('=')) else { continue };
+            let path = Utf8Path::new(value);
+            paths.insert(if path.is_absolute() {
+                AbsPathBuf::try_from(path.to_path_buf())
+                    .expect("an absolute UTF-8 Cargo config path remains absolute")
+            } else {
+                root.join(path)
+            });
+        }
+    }
+    if let Some(discovered) = discovered {
+        paths.extend(
+            discovered
+                .graph_input_paths()
+                .into_iter()
+                .filter_map(|path| AbsPathBuf::try_from(path).ok()),
+        );
+    }
+
+    let configured_home = graph_environment_value(extra_env, "CARGO_HOME");
+    let cargo_home = configured_home
+        .map(Utf8PathBuf::from)
+        .and_then(|path| {
+            if path.is_absolute() { AbsPathBuf::try_from(path).ok() } else { Some(root.join(path)) }
+        })
+        .or_else(|| {
+            ["HOME", "USERPROFILE"].into_iter().find_map(|name| {
+                graph_environment_value(extra_env, name)
+                    .map(Utf8PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .and_then(|path| AbsPathBuf::try_from(path).ok())
+                    .map(|home| home.join(".cargo"))
+            })
+        });
+    if let Some(cargo_home) = cargo_home {
+        paths.insert(cargo_home.join("config.toml"));
+        paths.insert(cargo_home.join("config"));
+    }
+    paths
+}
+
+fn graph_environment_value(
+    extra_env: &FxHashMap<String, Option<String>>,
+    name: &str,
+) -> Option<String> {
+    match extra_env.iter().find(|(key, _)| {
+        if cfg!(windows) { key.eq_ignore_ascii_case(name) } else { key.as_str() == name }
+    }) {
+        Some((_, value)) => value.clone(),
+        None => env::var(name).ok(),
+    }
+}
+
+#[test]
+fn graph_cargo_config_inputs_cover_hierarchy_origins_explicit_and_missing_states() {
+    let directory = temp_dir::TempDir::new().unwrap();
+    let root = AbsPathBuf::assert_utf8(directory.path().to_path_buf());
+    let workspace = root.join("parent/workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let explicit = root.join("explicit/config.toml");
+    let origin = root.join("reported/.cargo/config.toml");
+    let cargo_home = root.join("cargo-home");
+    let mut extra_env = FxHashMap::default();
+    extra_env.insert("CARGO_HOME".to_owned(), Some(cargo_home.to_string()));
+    let discovered =
+        CargoConfigFile::from_string_for_test(format!("build.target = \"test\" # {origin}\n"));
+
+    let paths = cargo_config_input_paths(
+        workspace.as_ref(),
+        Some(explicit.as_ref()),
+        &[&[
+            "--config".to_owned(),
+            "argument/config.toml".to_owned(),
+            "--config=build.jobs=2".to_owned(),
+        ]],
+        &extra_env,
+        Some(&discovered),
+    );
+
+    assert!(paths.contains(&workspace.join(".cargo/config.toml")));
+    assert!(paths.contains(&root.join("parent/.cargo/config")));
+    assert!(paths.contains(&explicit));
+    assert!(paths.contains(&workspace.join("argument/config.toml")));
+    assert!(paths.contains(&origin));
+    assert!(paths.contains(&cargo_home.join("config.toml")));
+    let captured = capture_graph_project_inputs(workspace.as_ref(), paths);
+    assert!(captured.iter().any(|(path, bytes)| path == &explicit && bytes.is_none()));
 }
 
 #[instrument(skip_all)]

@@ -20,7 +20,7 @@ mod ratoml;
 mod support;
 mod testdir;
 
-use std::{path::PathBuf, time::Instant};
+use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
 use ide_db::FxHashMap;
 use lsp_types::{
@@ -34,7 +34,8 @@ use lsp_types::{
 };
 use rust_analyzer::lsp::ext::{
     GraphSnapshotCheckpoint, GraphSnapshotCheckpointSource, GraphSnapshotParams,
-    GraphSnapshotRequest, GraphSnapshotResult, OnEnterRequest, RunnablesParams, RunnablesRequest,
+    GraphSnapshotRequest, GraphSnapshotResult, GraphSnapshotShard, OnEnterRequest, RunnablesParams,
+    RunnablesRequest,
 };
 use serde_json::json;
 use stdx::format_to_acc;
@@ -58,13 +59,33 @@ version = "0.0.0"
 [dependencies]
 dependency = { path = "dependency" }
 
+//- /.cargo/config.toml
+[build]
+rustflags = []
+
 //- /src/lib.rs
 use dependency::answer as local_answer;
 mod child;
+pub trait Parent {}
+pub struct Root;
+impl dependency::Shared for Root {}
+impl core::fmt::Debug for Root {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("Root")
+    }
+}
 pub fn answer() -> u8 { local_answer() }
 pub mod nested { pub use super::answer as alias; }
 
 //- /src/child.rs
+pub trait Child: super::Parent {}
+pub struct Leaf;
+impl dependency::Shared for Leaf {}
+impl core::fmt::Debug for Leaf {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("Leaf")
+    }
+}
 pub fn child() -> u8 { super::local_answer() }
 
 //- /dependency/Cargo.toml
@@ -74,6 +95,7 @@ version = "0.0.0"
 
 //- /dependency/src/lib.rs
 pub fn answer() -> u8 { 42 }
+pub trait Shared {}
 "#;
     let dir = TestDir::new();
     let restart_dir = dir.shared();
@@ -83,6 +105,13 @@ pub fn answer() -> u8 { 42 }
         first_server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams::default()),
     )
     .unwrap();
+    assert_unique_graph_node_ownership(&first.upserts);
+    let mut resident_shards = first
+        .upserts
+        .iter()
+        .cloned()
+        .map(|shard| (shard.key.clone(), shard))
+        .collect::<BTreeMap<_, _>>();
     let checkpoint = GraphSnapshotCheckpoint {
         protocol_version: first.protocol_version,
         schema_version: first.schema_version,
@@ -137,8 +166,8 @@ pub fn answer() -> u8 { 42 }
     assert!(resident.upserts.is_empty());
 
     server.open_file_with_text(
-        "src/lib.rs",
-        "use dependency::answer as local_answer;\nmod child;\npub fn answer() -> u8 { local_answer() + 1 }\npub mod nested { pub use super::answer as alias; }\n"
+        "src/child.rs",
+        "pub trait Child: super::Parent {}\npub struct Leaf;\nimpl dependency::Shared for Leaf {}\nimpl core::fmt::Debug for Leaf { fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { formatter.write_str(\"Leaf\") } }\npub fn child() -> u8 { super::local_answer() + 1 }\n"
             .to_owned(),
     );
     let edited: GraphSnapshotResult =
@@ -150,28 +179,98 @@ pub fn answer() -> u8 { 42 }
     assert!(!edited.phases.cache_hit);
     assert_eq!(edited.base_generation.as_deref(), Some(restored.generation.as_str()));
     assert_eq!(edited.upserts.len(), 1);
+    apply_graph_delta(&mut resident_shards, &edited);
+    let merged = resident_shards.values().cloned().collect::<Vec<_>>();
+    assert_unique_graph_node_ownership(&merged);
+    let nodes = merged.iter().flat_map(|shard| &shard.nodes).collect::<Vec<_>>();
+    let edges = merged.iter().flat_map(|shard| &shard.edges).collect::<Vec<_>>();
+    assert!(edges.iter().any(|edge| edge.kind == "extends"));
+    let debug = nodes
+        .iter()
+        .find(|node| {
+            edges.iter().filter(|edge| edge.kind == "implements" && edge.to == node.id).count() >= 2
+        })
+        .expect("shared trait target was not materialized");
+    assert!(
+        edges.iter().filter(|edge| edge.kind == "implements" && edge.to == debug.id).count() >= 2
+    );
 
     server.change_file_with_text(
-        "src/lib.rs",
+        "src/child.rs",
         2,
-        "use dependency::answer as renamed_answer;\nmod child;\npub fn answer() -> u8 { renamed_answer() + 1 }\npub mod nested { pub use super::answer as alias; }\n"
+        "pub trait Child: super::Parent {}\npub struct Leaf;\nimpl dependency::Shared for Leaf {}\nimpl core::fmt::Debug for Leaf { fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { formatter.write_str(\"Leaf\") } }\npub fn child() -> u8 { super::local_answer() + 2 }\n"
+            .to_owned(),
+    );
+    let second_edit: GraphSnapshotResult =
+        serde_json::from_value(server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams {
+            known_generation: Some(edited.generation.clone()),
+            checkpoint: None,
+        }))
+        .unwrap();
+    assert_eq!(second_edit.upserts.len(), 1);
+    apply_graph_delta(&mut resident_shards, &second_edit);
+    assert_unique_graph_node_ownership(&resident_shards.values().cloned().collect::<Vec<_>>());
+
+    server.open_file_with_text(
+        "src/lib.rs",
+        "use dependency::answer as renamed_answer;\nmod child;\npub trait Parent {}\npub struct Root;\nimpl dependency::Shared for Root {}\nimpl core::fmt::Debug for Root { fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { formatter.write_str(\"Root\") } }\npub fn answer() -> u8 { renamed_answer() }\npub mod nested { pub use super::answer as alias; }\n"
             .to_owned(),
     );
     let import_renamed: GraphSnapshotResult =
         serde_json::from_value(server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams {
-            known_generation: Some(edited.generation.clone()),
+            known_generation: Some(second_edit.generation.clone()),
             checkpoint: None,
         }))
         .unwrap();
     assert_eq!(import_renamed.universe.digest, edited.universe.digest);
     assert!(import_renamed.upserts.iter().any(|shard| shard.source.ends_with("src/child.rs")));
 
+    server.write_watched_file(".cargo/config.toml", "[build\n");
+    let malformed_rejected = (0..20).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        server
+            .send_request_result::<GraphSnapshotRequest>(GraphSnapshotParams {
+                known_generation: Some(import_renamed.generation.clone()),
+                checkpoint: None,
+            })
+            .is_err_and(|error| error.code == lsp_server::ErrorCode::ServerCancelled as i32)
+    });
+    assert!(malformed_rejected, "malformed Cargo config did not close the graph snapshot fence");
+
+    server.write_watched_file(
+        ".cargo/config.toml",
+        "[build]\nrustflags = [\"--cfg\", \"samchon_graph_retry\"]\n",
+    );
+    let mut last_config_error = None;
+    let config_recovered = (0..30)
+        .find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            match server.send_request_result::<GraphSnapshotRequest>(GraphSnapshotParams {
+                known_generation: Some(import_renamed.generation.clone()),
+                checkpoint: None,
+            }) {
+                Ok(value) => Some(serde_json::from_value::<GraphSnapshotResult>(value).unwrap()),
+                Err(error) if error.code == lsp_server::ErrorCode::ServerCancelled as i32 => {
+                    last_config_error = Some(error.message);
+                    None
+                }
+                Err(error) => panic!("unexpected Cargo config recovery error: {error:#?}"),
+            }
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "graph snapshot did not recover after restoring Cargo config: {last_config_error:?}"
+            )
+        });
+    assert_ne!(config_recovered.universe.digest, import_renamed.universe.digest);
+    assert_eq!(config_recovered.base_generation, None);
+
     server
         .open_file_with_text("dependency/src/lib.rs", "pub fn answer() -> u8 { 43 }\n".to_owned());
     let dependency_changed = (0..4)
         .find_map(|_| {
             match server.send_request_result::<GraphSnapshotRequest>(GraphSnapshotParams {
-                known_generation: Some(import_renamed.generation.clone()),
+                known_generation: Some(config_recovered.generation.clone()),
                 checkpoint: None,
             }) {
                 Ok(value) => Some(serde_json::from_value::<GraphSnapshotResult>(value).unwrap()),
@@ -180,9 +279,41 @@ pub fn answer() -> u8 { 42 }
             }
         })
         .expect("graph snapshot remained invalidated after four retries");
-    assert_ne!(dependency_changed.universe.digest, import_renamed.universe.digest);
+    assert_ne!(dependency_changed.universe.digest, config_recovered.universe.digest);
     assert_eq!(dependency_changed.base_generation, None);
     assert!(!dependency_changed.upserts.is_empty());
+}
+
+fn apply_graph_delta(
+    shards: &mut BTreeMap<String, GraphSnapshotShard>,
+    result: &GraphSnapshotResult,
+) {
+    for key in &result.deletes {
+        shards.remove(key);
+    }
+    for shard in &result.upserts {
+        shards.insert(shard.key.clone(), shard.clone());
+    }
+}
+
+fn assert_unique_graph_node_ownership(shards: &[GraphSnapshotShard]) {
+    let mut owners = BTreeMap::new();
+    for shard in shards {
+        for node in &shard.nodes {
+            assert_eq!(
+                owners.insert(node.id.clone(), shard.source.clone()),
+                None,
+                "native graph node {} was emitted by multiple shards",
+                node.id
+            );
+        }
+    }
+    for shard in shards {
+        for edge in &shard.edges {
+            assert!(owners.contains_key(&edge.from), "edge source {} has no graph node", edge.from);
+            assert!(owners.contains_key(&edge.to), "edge target {} has no graph node", edge.to);
+        }
+    }
 }
 
 #[test]

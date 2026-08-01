@@ -71,6 +71,10 @@ pub(crate) struct GraphSnapshotCache {
     external_input_event_fence: Arc<StdMutex<u64>>,
     external_input_event_epoch: u64,
     external_input_watcher_stale: bool,
+    source_input_watcher: Option<RecommendedWatcher>,
+    source_input_event_fence: Arc<StdMutex<u64>>,
+    source_input_event_epoch: u64,
+    source_input_watcher_stale: bool,
 }
 
 impl Default for GraphSnapshotCache {
@@ -90,6 +94,10 @@ impl Default for GraphSnapshotCache {
             external_input_event_fence: Arc::new(StdMutex::new(0)),
             external_input_event_epoch: 0,
             external_input_watcher_stale: true,
+            source_input_watcher: None,
+            source_input_event_fence: Arc::new(StdMutex::new(0)),
+            source_input_event_epoch: 0,
+            source_input_watcher_stale: true,
         }
     }
 }
@@ -104,6 +112,8 @@ struct CachedSnapshot {
     phases: GraphSnapshotPhases,
     shards: BTreeMap<String, Arc<GraphSnapshotShard>>,
     interface_fingerprints: BTreeMap<String, String>,
+    source_inputs: BTreeMap<FileId, String>,
+    node_owners: BTreeMap<String, String>,
     delta_base: Option<String>,
     delta_upserts: Vec<Arc<GraphSnapshotShard>>,
     delta_deletes: Vec<String>,
@@ -130,6 +140,7 @@ impl GraphSnapshotCache {
         self.revision = self.revision.wrapping_add(1);
         self.dirty_files.clear();
         self.full_rebuild = true;
+        self.source_input_watcher_stale = true;
     }
 
     fn invalidate_universe(&mut self) {
@@ -167,15 +178,16 @@ pub(crate) fn handle(
         ));
     }
     let started = Instant::now();
-    let source_inputs = validate_source_inputs(&snap)?;
     ensure_external_inputs(&snap)?;
-    validate_project_model_inputs(&snap)?;
     let observed_universe = universe(&snap)?;
     let cached_response = {
         let mut cache = snap.graph_snapshot_cache.lock();
-        let event_fence = cache.external_input_event_fence.clone();
-        let event_guard = event_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        drain_external_input_events_at(&mut cache, *event_guard);
+        let external_fence = cache.external_input_event_fence.clone();
+        let external_guard = external_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_fence = cache.source_input_event_fence.clone();
+        let source_guard = source_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        drain_external_input_events_at(&mut cache, *external_guard);
+        drain_source_input_events_at(&mut cache, *source_guard);
         if cache.committed.as_ref().is_some_and(|cached| cached.universe != observed_universe) {
             cache.invalidate_universe();
         }
@@ -188,9 +200,20 @@ pub(crate) fn handle(
         result.phases.total_millis = elapsed_millis(started);
         return Ok(result);
     }
+    validate_project_model_inputs(&snap)?;
     if let Some(checkpoint) = params.checkpoint.as_ref() {
-        let mut result =
-            checkpoint_response(&snap, &observed_universe, checkpoint, &params, &source_inputs)?;
+        let source_files =
+            StaticIndex::graph_source_files(&snap.analysis, VendoredLibrariesConfig::Excluded);
+        let source_epoch = ensure_source_input_watcher(&snap, &source_files)?;
+        let source_inputs = validate_source_inputs(&snap, &source_files)?;
+        let mut result = checkpoint_response(
+            &snap,
+            &observed_universe,
+            checkpoint,
+            &params,
+            &source_inputs,
+            source_epoch,
+        )?;
         result.phases.total_millis = elapsed_millis(started);
         return Ok(result);
     }
@@ -200,6 +223,8 @@ pub(crate) fn handle(
         requested_full_rebuild,
         cached_universe,
         cached_interface_fingerprints,
+        cached_source_inputs,
+        cached_node_owners,
     ) = {
         let cache = snap.graph_snapshot_cache.lock();
         (
@@ -212,6 +237,8 @@ pub(crate) fn handle(
                 .as_ref()
                 .map(|cached| cached.interface_fingerprints.clone())
                 .unwrap_or_default(),
+            cache.committed.as_ref().map(|cached| cached.source_inputs.clone()).unwrap_or_default(),
+            cache.committed.as_ref().map(|cached| cached.node_owners.clone()).unwrap_or_default(),
         )
     };
 
@@ -255,6 +282,20 @@ pub(crate) fn handle(
     }
     let semantic_millis = elapsed_millis(semantic_started);
 
+    let indexed_files = index.files.iter().map(|file| file.file_id).collect::<Vec<_>>();
+    let source_epoch = if full_rebuild {
+        ensure_source_input_watcher(&snap, &indexed_files)?
+    } else {
+        current_source_input_epoch(&snap)?
+    };
+    let validated_source_inputs = validate_source_inputs(&snap, &indexed_files)?;
+    let mut source_inputs = if full_rebuild { BTreeMap::new() } else { cached_source_inputs };
+    source_inputs.extend(validated_source_inputs);
+    let dirty_sources =
+        indexed_files.iter().map(|&file_id| source_path(&snap, file_id)).collect::<BTreeSet<_>>();
+    let mut retained_node_owners = if full_rebuild { BTreeMap::new() } else { cached_node_owners };
+    retained_node_owners.retain(|_, source| !dirty_sources.contains(source));
+
     let shard_started = Instant::now();
     let snapshot_universe = if requested_full_rebuild {
         observed_universe
@@ -266,17 +307,17 @@ pub(crate) fn handle(
         }
         cached
     };
-    let shards =
-        build_shards(&snap, index, &snapshot_universe, &interface_fingerprints, &source_inputs)?;
+    let built = build_shards(
+        &snap,
+        index,
+        &snapshot_universe,
+        &interface_fingerprints,
+        &source_inputs,
+        retained_node_owners,
+    )?;
     let shard_millis = elapsed_millis(shard_started);
 
     let encode_started = Instant::now();
-    if validate_source_inputs(&snap)? != source_inputs {
-        snap.graph_snapshot_cache.lock().invalidate_all();
-        return Err(retry_error(
-            "graph snapshot source inputs moved while it was being built; retry the request",
-        ));
-    }
     ensure_external_inputs(&snap)?;
     validate_project_model_inputs(&snap)?;
     if universe(&snap)? != snapshot_universe {
@@ -286,9 +327,17 @@ pub(crate) fn handle(
         ));
     }
     let mut cache = snap.graph_snapshot_cache.lock();
-    let event_fence = cache.external_input_event_fence.clone();
-    let event_guard = event_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    drain_external_input_events_at(&mut cache, *event_guard);
+    let external_fence = cache.external_input_event_fence.clone();
+    let external_guard = external_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source_fence = cache.source_input_event_fence.clone();
+    let source_guard = source_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    drain_external_input_events_at(&mut cache, *external_guard);
+    if *source_guard != source_epoch {
+        cache.invalidate_all();
+        return Err(retry_error(
+            "graph snapshot source inputs moved while it was being built; retry the request",
+        ));
+    }
     ensure_cache_revision(
         &cache,
         revision,
@@ -304,7 +353,8 @@ pub(crate) fn handle(
             cache_hit: true,
         };
         drop(cache);
-        drop(event_guard);
+        drop(source_guard);
+        drop(external_guard);
         return Ok(response.into_result());
     }
     let mut merged = if full_rebuild {
@@ -317,7 +367,7 @@ pub(crate) fn handle(
         merged.retain(|_, shard| !dirty_sources.contains(&shard.source));
         merged
     };
-    for shard in shards {
+    for shard in built.shards {
         merged.insert(shard.key.clone(), Arc::new(shard));
     }
 
@@ -375,6 +425,8 @@ pub(crate) fn handle(
         phases,
         shards: merged,
         interface_fingerprints,
+        source_inputs,
+        node_owners: built.node_owners,
         delta_base: base_generation,
         delta_upserts,
         delta_deletes,
@@ -384,7 +436,8 @@ pub(crate) fn handle(
     cache.dirty_files.clear();
     cache.full_rebuild = false;
     drop(cache);
-    drop(event_guard);
+    drop(source_guard);
+    drop(external_guard);
     Ok(response.into_result())
 }
 
@@ -394,6 +447,7 @@ fn checkpoint_response(
     checkpoint: &GraphSnapshotCheckpoint,
     params: &GraphSnapshotParams,
     source_inputs: &BTreeMap<FileId, String>,
+    source_epoch: u64,
 ) -> anyhow::Result<GraphSnapshotResult> {
     if checkpoint.protocol_version != PROTOCOL_VERSION
         || checkpoint.schema_version != SCHEMA_VERSION
@@ -429,6 +483,7 @@ fn checkpoint_response(
         .collect::<BTreeMap<_, _>>();
     let mut shards = BTreeMap::new();
     let mut interface_fingerprints = BTreeMap::new();
+    let mut node_owners = BTreeMap::new();
     for shard in &checkpoint.shards {
         let expected_key = format!("{}\0{}", snapshot_universe.target, shard.source);
         let valid = shard.key == expected_key
@@ -451,6 +506,10 @@ fn checkpoint_response(
             || interface_fingerprints
                 .insert(shard.source.clone(), shard.interface_fingerprint.clone())
                 .is_some()
+            || shard
+                .nodes
+                .iter()
+                .any(|node| node_owners.insert(node.id.clone(), shard.source.clone()).is_some())
         {
             return Err(retry_error(
                 "persisted graph checkpoint shards are invalid; rebuild and retry",
@@ -474,10 +533,24 @@ fn checkpoint_response(
             "graph snapshot universe moved while validating a checkpoint; retry",
         ));
     }
+    let source_files = source_inputs.keys().copied().collect::<Vec<_>>();
+    if validate_source_inputs(snap, &source_files)? != *source_inputs {
+        return Err(retry_error(
+            "graph snapshot source inputs moved while validating a checkpoint; retry",
+        ));
+    }
     let mut cache = snap.graph_snapshot_cache.lock();
-    let event_fence = cache.external_input_event_fence.clone();
-    let event_guard = event_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    drain_external_input_events_at(&mut cache, *event_guard);
+    let external_fence = cache.external_input_event_fence.clone();
+    let external_guard = external_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source_fence = cache.source_input_event_fence.clone();
+    let source_guard = source_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    drain_external_input_events_at(&mut cache, *external_guard);
+    if *source_guard != source_epoch {
+        cache.invalidate_all();
+        return Err(retry_error(
+            "graph snapshot source inputs moved while validating a checkpoint; retry",
+        ));
+    }
     if let Some(committed) = cache.current() {
         return Ok(response_plan(committed, params.known_generation.as_deref(), true).into_result());
     }
@@ -497,6 +570,8 @@ fn checkpoint_response(
         phases: GraphSnapshotPhases { cache_hit: true, ..GraphSnapshotPhases::default() },
         shards,
         interface_fingerprints,
+        source_inputs: source_inputs.clone(),
+        node_owners,
         delta_base: None,
         delta_upserts: Vec::new(),
         delta_deletes: Vec::new(),
@@ -553,14 +628,113 @@ fn validate_project_model_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<(
     Ok(())
 }
 
-fn validate_source_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<BTreeMap<FileId, String>> {
-    StaticIndex::graph_source_files(&snap.analysis, VendoredLibrariesConfig::Excluded)
-        .into_iter()
+fn validate_source_inputs(
+    snap: &GlobalStateSnapshot,
+    files: &[FileId],
+) -> anyhow::Result<BTreeMap<FileId, String>> {
+    files
+        .iter()
+        .copied()
         .map(|file_id| {
             let text = snap.analysis.file_text(file_id)?;
             Ok((file_id, checker_source_digest(snap, file_id, &text)?))
         })
         .collect()
+}
+
+fn ensure_source_input_watcher(
+    snap: &GlobalStateSnapshot,
+    files: &[FileId],
+) -> anyhow::Result<u64> {
+    {
+        let cache = snap.graph_snapshot_cache.lock();
+        if cache.source_input_watcher.is_some() && !cache.source_input_watcher_stale {
+            drop(cache);
+            return current_source_input_epoch(snap);
+        }
+    }
+    let roots = files
+        .iter()
+        .map(|&file_id| {
+            let file = snap.file_id_to_file_path(file_id);
+            let path = file.as_path().ok_or_else(|| {
+                retry_error(&format!(
+                    "graph source {} has no disk identity; retry after saving it",
+                    file
+                ))
+            })?;
+            let parent = path.parent().ok_or_else(|| {
+                retry_error(&format!("graph source {path} has no watchable parent; retry"))
+            })?;
+            Ok(PathBuf::from(parent.as_str()))
+        })
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
+    let event_fence = snap.graph_snapshot_cache.lock().source_input_event_fence.clone();
+    let watcher = source_input_watcher(&event_fence, roots)?;
+    let mut cache = snap.graph_snapshot_cache.lock();
+    let event_guard = event_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    drain_source_input_events_at(&mut cache, *event_guard);
+    let retired = cache.source_input_watcher.replace(watcher);
+    cache.source_input_watcher_stale = false;
+    let epoch = *event_guard;
+    drop(event_guard);
+    drop(cache);
+    drop(retired);
+    Ok(epoch)
+}
+
+fn current_source_input_epoch(snap: &GlobalStateSnapshot) -> anyhow::Result<u64> {
+    let mut cache = snap.graph_snapshot_cache.lock();
+    if cache.source_input_watcher.is_none() || cache.source_input_watcher_stale {
+        return Err(retry_error(
+            "graph source watcher is unavailable for an incremental snapshot; retry",
+        ));
+    }
+    let event_fence = cache.source_input_event_fence.clone();
+    let event_guard = event_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    drain_source_input_events_at(&mut cache, *event_guard);
+    Ok(*event_guard)
+}
+
+fn source_input_watcher(
+    event_fence: &Arc<StdMutex<u64>>,
+    roots: BTreeSet<PathBuf>,
+) -> anyhow::Result<RecommendedWatcher> {
+    let event_fence = Arc::clone(event_fence);
+    let mut watcher = RecommendedWatcher::new(
+        move |event: notify::Result<notify::Event>| {
+            if event.as_ref().is_ok_and(|event| matches!(event.kind, EventKind::Access(_))) {
+                return;
+            }
+            let mut epoch = event_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *epoch = epoch.wrapping_add(1);
+        },
+        NotifyConfig::default().with_follow_symlinks(false),
+    )
+    .map_err(|error| {
+        retry_error(&format!("graph source watcher could not start: {error}; retry the request"))
+    })?;
+    for root in roots {
+        watcher.watch(&root, RecursiveMode::NonRecursive).map_err(|error| {
+            retry_error(&format!(
+                "graph source root {} could not be watched: {error}; retry the request",
+                root.display()
+            ))
+        })?;
+    }
+    Ok(watcher)
+}
+
+fn drain_source_input_events_at(cache: &mut GraphSnapshotCache, event_epoch: u64) {
+    if cache.source_input_event_epoch == event_epoch {
+        return;
+    }
+    cache.source_input_event_epoch = event_epoch;
+    let revision_already_moved =
+        cache.committed.as_ref().is_some_and(|cached| cached.revision != cache.revision);
+    if !revision_already_moved {
+        cache.invalidate_all();
+    }
 }
 
 fn checker_source_digest(
@@ -673,6 +847,7 @@ fn producer() -> GraphSnapshotProducer {
 struct ExternalGraphInput {
     identity: String,
     root: PathBuf,
+    optional: bool,
 }
 
 fn external_graph_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<Vec<ExternalGraphInput>> {
@@ -693,17 +868,17 @@ fn external_graph_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<Vec<Exter
                     ExternalGraphInput {
                         identity: format!("path-package={}:{}", package.id, package.manifest),
                         root: root.to_path_buf(),
+                        optional: false,
                     }
                 })
             })
         })
         .collect::<Vec<_>>();
     for workspace in snap.workspaces.iter() {
-        inputs.extend(workspace.graph_project_inputs.iter().filter_map(|(path, bytes)| {
-            bytes.as_ref().map(|_| ExternalGraphInput {
-                identity: format!("project-input={path}"),
-                root: PathBuf::from(path.as_str()),
-            })
+        inputs.extend(workspace.graph_project_inputs.iter().map(|(path, _)| ExternalGraphInput {
+            identity: format!("project-input={path}"),
+            root: PathBuf::from(path.as_str()),
+            optional: true,
         }));
         let (rustc_path, cargo_path, environment) = match &workspace.kind {
             ProjectWorkspaceKind::Cargo { cargo, .. }
@@ -732,6 +907,7 @@ fn external_graph_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<Vec<Exter
         inputs.push(ExternalGraphInput {
             identity: format!("rustc={}", rustc_path.to_string_lossy()),
             root: rustc_path,
+            optional: false,
         });
         if let Some(cargo_path) = cargo_path {
             let cargo_path: &std::path::Path = cargo_path.as_ref();
@@ -739,12 +915,14 @@ fn external_graph_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<Vec<Exter
             inputs.push(ExternalGraphInput {
                 identity: format!("cargo={}", cargo_path.to_string_lossy()),
                 root: cargo_path,
+                optional: false,
             });
         }
         if let Some(root) = workspace.sysroot.rust_lib_src_root() {
             inputs.push(ExternalGraphInput {
                 identity: format!("rust-lib-src={root}"),
                 root: PathBuf::from(root.as_str()),
+                optional: false,
             });
         }
         let proc_macro_server = snap
@@ -755,6 +933,7 @@ fn external_graph_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<Vec<Exter
             inputs.push(ExternalGraphInput {
                 identity: format!("proc-macro-server={server}"),
                 root: PathBuf::from(server.as_str()),
+                optional: false,
             });
         }
     }
@@ -979,12 +1158,25 @@ fn external_input_watch_roots(
 ) -> anyhow::Result<BTreeMap<PathBuf, bool>> {
     let mut roots = BTreeMap::new();
     for input in inputs {
-        let metadata = fs::metadata(&input.root).map_err(|error| {
-            retry_error(&format!(
-                "external graph input {} is unavailable: {error}; retry the request",
-                input.root.display()
-            ))
-        })?;
+        let metadata = match fs::metadata(&input.root) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if input.optional
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+            {
+                insert_missing_target_watch_roots(&mut roots, input.root.clone());
+                continue;
+            }
+            Err(error) => {
+                return Err(retry_error(&format!(
+                    "external graph input {} is unavailable: {error}; retry the request",
+                    input.root.display()
+                )));
+            }
+        };
         insert_watch_root(&mut roots, input.root.clone(), metadata.is_dir());
         if let Some(parent) = input.root.parent().filter(|parent| !parent.as_os_str().is_empty()) {
             insert_watch_root(&mut roots, parent.to_path_buf(), false);
@@ -1009,6 +1201,21 @@ fn capture_external_inputs(inputs: &[ExternalGraphInput]) -> anyhow::Result<Exte
     let mut content = BTreeMap::<Vec<u8>, Vec<u8>>::new();
     let mut symlink_watch_roots = BTreeMap::new();
     for input in inputs {
+        if input.optional
+            && fs::symlink_metadata(&input.root).is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                )
+            })
+        {
+            content.insert(
+                external_input_key_suffix(&external_input_key(input, Path::new("")), b"missing"),
+                Vec::new(),
+            );
+            insert_missing_target_watch_roots(&mut symlink_watch_roots, input.root.clone());
+            continue;
+        }
         for entry in WalkDir::new(&input.root).follow_links(true) {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -1526,13 +1733,19 @@ struct MutableShard {
     unresolved: Vec<GraphSnapshotUnresolved>,
 }
 
+struct BuiltShards {
+    shards: Vec<GraphSnapshotShard>,
+    node_owners: BTreeMap<String, String>,
+}
+
 fn build_shards(
     snap: &GlobalStateSnapshot,
     index: StaticIndex<'_>,
     universe: &GraphSnapshotUniverse,
     interface_fingerprints: &BTreeMap<String, String>,
     source_inputs: &BTreeMap<FileId, String>,
-) -> anyhow::Result<Vec<GraphSnapshotShard>> {
+    mut id_sources: BTreeMap<String, String>,
+) -> anyhow::Result<BuiltShards> {
     let files = index.files;
     let relations = index.relations;
     let tokens = index.tokens.iter().map(|(_, token)| token).collect::<Vec<_>>();
@@ -1563,13 +1776,12 @@ fn build_shards(
     let dependency_source = "bundled:///rust/dependencies".to_owned();
     let mut node_sources = Vec::with_capacity(tokens.len());
     let mut node_present = Vec::with_capacity(tokens.len());
-    let mut id_sources = BTreeMap::new();
-
     for token in &tokens {
         let definition = token.definition;
         let external = token.external || definition.is_none();
-        let definition_source =
-            definition.and_then(|definition| sources.get(&definition.file_id).cloned());
+        let definition_source = (!external)
+            .then(|| definition.map(|definition| source_path(snap, definition.file_id)))
+            .flatten();
         let file = if external {
             dependency_source.clone()
         } else {
@@ -1577,17 +1789,15 @@ fn build_shards(
                 .map(|definition| source_path(snap, definition.file_id))
                 .unwrap_or_else(|| dependency_source.clone())
         };
-        let definition_owned = definition.is_some() && !external;
-        let mut owner_sources = definition_source.into_iter().collect::<BTreeSet<_>>();
-        if owner_sources.is_empty() && !definition_owned {
-            owner_sources.extend(
+        let owner_source =
+            id_sources.get(&token.stable_id).cloned().or(definition_source).or_else(|| {
                 token
                     .references
                     .iter()
                     .filter(|reference| !reference.is_definition)
-                    .filter_map(|reference| sources.get(&reference.range.file_id).cloned()),
-            );
-        }
+                    .filter_map(|reference| sources.get(&reference.range.file_id).cloned())
+                    .next()
+            });
         let name = token
             .display_name
             .clone()
@@ -1605,24 +1815,21 @@ fn build_shards(
                 .then(|| definition.and_then(|range| evidence(snap, range).ok()))
                 .flatten(),
         });
-        node_present.push(node.is_some());
-        node_sources.push(node.as_ref().and_then(|_| owner_sources.first().cloned()));
-        if let Some(node) = node {
-            for source in owner_sources {
-                id_sources.entry(node.id.clone()).or_insert_with(|| source.clone());
-                shards
-                    .entry(source.clone())
-                    .or_insert_with(|| MutableShard { source, ..Default::default() })
-                    .nodes
-                    .push(node.clone());
+        if let (Some(node), Some(source)) = (node.as_ref(), owner_source.as_ref()) {
+            id_sources.entry(node.id.clone()).or_insert_with(|| source.clone());
+            if let Some(shard) = shards.get_mut(source) {
+                shard.nodes.push(node.clone());
             }
         }
+        node_present.push(id_sources.contains_key(&token.stable_id));
+        node_sources.push(owner_source);
     }
 
     let mut file_nodes = BTreeMap::new();
     for (&file_id, source) in &sources {
         let id = format!("rust-file-v1|{}:{}", source.len(), source);
         file_nodes.insert(file_id, id.clone());
+        id_sources.insert(id.clone(), source.clone());
         shards.get_mut(source).unwrap().nodes.push(GraphSnapshotNode {
             id,
             kind: "file".to_owned(),
@@ -1659,6 +1866,7 @@ fn build_shards(
                 continue;
             };
             if let Some(export) = &reference.export {
+                id_sources.insert(export.alias_id.clone(), source.clone());
                 shards.get_mut(source).unwrap().nodes.push(GraphSnapshotNode {
                     id: export.alias_id.clone(),
                     kind: graph_node_kind(token.kind).to_owned(),
@@ -1731,20 +1939,24 @@ fn build_shards(
             let Some(name) = relation.to_display_name.clone() else {
                 continue;
             };
-            let target_source =
-                relation.to_definition_file.and_then(|file_id| sources.get(&file_id).cloned());
-            shards.get_mut(source).unwrap().nodes.push(GraphSnapshotNode {
-                id: relation.to.clone(),
-                kind: graph_node_kind(relation.to_kind).to_owned(),
-                name,
-                qualified_name: relation.to_qualified_name.clone(),
-                file: target_source.clone().unwrap_or_else(|| dependency_source.clone()),
-                external: relation.to_external || target_source.is_none(),
-                exported: relation.to_exported,
-                signature: Some(relation.to_signature.clone()),
-                evidence: None,
-            });
-            id_sources.insert(relation.to.clone(), source.clone());
+            let target_source = (!relation.to_external)
+                .then(|| relation.to_definition_file.map(|file_id| source_path(snap, file_id)))
+                .flatten();
+            let owner_source = target_source.clone().unwrap_or_else(|| source.clone());
+            if let Some(shard) = shards.get_mut(&owner_source) {
+                shard.nodes.push(GraphSnapshotNode {
+                    id: relation.to.clone(),
+                    kind: graph_node_kind(relation.to_kind).to_owned(),
+                    name,
+                    qualified_name: relation.to_qualified_name.clone(),
+                    file: target_source.clone().unwrap_or_else(|| dependency_source.clone()),
+                    external: relation.to_external || target_source.is_none(),
+                    exported: relation.to_exported,
+                    signature: Some(relation.to_signature.clone()),
+                    evidence: None,
+                });
+            }
+            id_sources.insert(relation.to.clone(), owner_source);
         }
         let kind = match relation.kind {
             StaticRelationKind::Extends => "extends",
@@ -1957,7 +2169,7 @@ fn build_shards(
         });
     }
     result.sort_by(|a, b| a.key.cmp(&b.key));
-    Ok(result)
+    Ok(BuiltShards { shards: result, node_owners: id_sources })
 }
 
 fn enclosing_owner<'a>(
@@ -2235,9 +2447,10 @@ mod tests {
 
     use super::{
         CachedSnapshot, ExternalGraphInput, GraphSnapshotCache, capture_external_inputs,
-        checker_disk_digest, digest_json, drain_external_input_events, ensure_cache_revision,
-        external_input_watch_roots, interfaces_changed, nearest_existing_watch_root,
-        resolve_external_tool_path, response_for, shard_digest, write_canonical_json,
+        checker_disk_digest, digest_json, drain_external_input_events,
+        drain_source_input_events_at, ensure_cache_revision, external_input_watch_roots,
+        interfaces_changed, nearest_existing_watch_root, resolve_external_tool_path, response_for,
+        shard_digest, write_canonical_json,
     };
 
     #[test]
@@ -2318,6 +2531,8 @@ mod tests {
             },
             shards: BTreeMap::from([(shard.key.clone(), Arc::new(shard.clone()))]),
             interface_fingerprints: BTreeMap::new(),
+            source_inputs: BTreeMap::new(),
+            node_owners: BTreeMap::new(),
             delta_base: Some("old".to_owned()),
             delta_upserts: vec![Arc::new(shard)],
             delta_deletes: vec!["deleted".to_owned()],
@@ -2359,6 +2574,8 @@ mod tests {
                 phases: GraphSnapshotPhases::default(),
                 shards: BTreeMap::new(),
                 interface_fingerprints: BTreeMap::new(),
+                source_inputs: BTreeMap::new(),
+                node_owners: BTreeMap::new(),
                 delta_base: None,
                 delta_upserts: Vec::new(),
                 delta_deletes: Vec::new(),
@@ -2371,6 +2588,9 @@ mod tests {
         assert!(!cache.full_rebuild);
         assert!(cache.dirty_files.contains(&file));
         assert!(cache.current().is_none());
+
+        drain_source_input_events_at(&mut cache, 1);
+        assert!(!cache.full_rebuild, "a VFS-invalidated edit retains its dirty-file delta");
 
         cache.invalidate_all();
         assert!(cache.full_rebuild);
@@ -2448,6 +2668,7 @@ mod tests {
         let dependency = |identity: &str| ExternalGraphInput {
             identity: identity.to_owned(),
             root: root.clone(),
+            optional: false,
         };
         let initial = capture_external_inputs(&[dependency("package-a")]).unwrap().digest;
         fs::write(root.join(".git/config"), "semantic-input-b\n").unwrap();
@@ -2459,6 +2680,33 @@ mod tests {
         assert_ne!(initial, hidden);
         assert_ne!(hidden, generated);
         assert_ne!(generated, renamed_package);
+    }
+
+    #[test]
+    fn optional_external_inputs_fence_missing_creation_and_removal() {
+        let directory = temp_dir::TempDir::new().unwrap();
+        let input = directory.path().join("missing/config.toml");
+        let inputs = [ExternalGraphInput {
+            identity: "cargo-config".to_owned(),
+            root: input.clone(),
+            optional: true,
+        }];
+        let missing = capture_external_inputs(&inputs).unwrap();
+        assert_eq!(
+            external_input_watch_roots(&inputs, &missing.symlink_watch_roots)
+                .unwrap()
+                .get(directory.path()),
+            Some(&false),
+        );
+
+        fs::create_dir_all(input.parent().unwrap()).unwrap();
+        fs::write(&input, "[build]\ntarget-dir = 'target'\n").unwrap();
+        let created = capture_external_inputs(&inputs).unwrap();
+        assert_ne!(created.digest, missing.digest);
+
+        fs::remove_file(&input).unwrap();
+        let removed = capture_external_inputs(&inputs).unwrap();
+        assert_eq!(removed.digest, missing.digest);
     }
 
     #[test]
@@ -2540,7 +2788,11 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let tool = root.join("rustc");
         fs::write(&tool, "tool").unwrap();
-        let inputs = [ExternalGraphInput { identity: "rustc".to_owned(), root: tool.clone() }];
+        let inputs = [ExternalGraphInput {
+            identity: "rustc".to_owned(),
+            root: tool.clone(),
+            optional: false,
+        }];
         let missing_ancestor = directory.path().to_path_buf();
         let supplemental = BTreeMap::from([(missing_ancestor.clone(), false)]);
 
@@ -2561,8 +2813,11 @@ mod tests {
         fs::create_dir_all(root.join("real")).unwrap();
         fs::write(root.join("real/generated.rs"), "pub const GENERATED: u8 = 1;\n").unwrap();
         symlink(root.join("real"), root.join("linked")).unwrap();
-        let dependencies =
-            [ExternalGraphInput { identity: "package".to_owned(), root: root.clone() }];
+        let dependencies = [ExternalGraphInput {
+            identity: "package".to_owned(),
+            root: root.clone(),
+            optional: false,
+        }];
         let initial = capture_external_inputs(&dependencies).unwrap().digest;
         fs::write(root.join("real/generated.rs"), "pub const GENERATED: u8 = 2;\n").unwrap();
         let changed = capture_external_inputs(&dependencies).unwrap().digest;
@@ -2587,7 +2842,11 @@ mod tests {
         fs::write(dependency.join("lib.rs"), "pub fn before() {}\n").unwrap();
         symlink(&dependency, outside.join("alias")).unwrap();
         symlink(outside.join("alias"), input.join("link")).unwrap();
-        let inputs = [ExternalGraphInput { identity: "package".to_owned(), root: input.clone() }];
+        let inputs = [ExternalGraphInput {
+            identity: "package".to_owned(),
+            root: input.clone(),
+            optional: false,
+        }];
         let capture = capture_external_inputs(&inputs).unwrap();
         assert_eq!(capture.symlink_watch_roots.get(&dependency), Some(&true));
         let fence = Arc::new(StdMutex::new(0));
@@ -2667,7 +2926,11 @@ mod tests {
         let root = directory.path().to_path_buf();
         symlink("missing.rs", root.join("broken.rs")).unwrap();
         symlink(".", root.join("cycle")).unwrap();
-        let inputs = [ExternalGraphInput { identity: "package".to_owned(), root: root.clone() }];
+        let inputs = [ExternalGraphInput {
+            identity: "package".to_owned(),
+            root: root.clone(),
+            optional: false,
+        }];
 
         let initial = capture_external_inputs(&inputs).unwrap();
         fs::remove_file(root.join("broken.rs")).unwrap();
@@ -2689,7 +2952,7 @@ mod tests {
         let second = root.join(OsString::from_vec(vec![b'f', 0x81]));
         fs::write(&first, "first").unwrap();
         fs::write(&second, "second").unwrap();
-        let inputs = [ExternalGraphInput { identity: "package".to_owned(), root }];
+        let inputs = [ExternalGraphInput { identity: "package".to_owned(), root, optional: false }];
 
         let initial = capture_external_inputs(&inputs).unwrap().digest;
         fs::write(&first, "changed-first").unwrap();

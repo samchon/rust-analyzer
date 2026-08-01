@@ -512,6 +512,16 @@ impl Server {
         )
     }
 
+    pub(crate) fn write_watched_file(&self, path: &str, text: &str) {
+        fs::write(self.dir.path().join(path), text).unwrap();
+        self.notification::<lsp_types::DidChangeWatchedFilesNotification>(
+            lsp_types::DidChangeWatchedFilesParams::new(vec![lsp_types::FileEvent::new(
+                self.doc_id(path).uri,
+                lsp_types::FileChangeType::Changed,
+            )]),
+        )
+    }
+
     pub(crate) fn open_file_with_text(&self, path: &str, text: String) {
         fs::write(self.dir.path().join(path), &text).unwrap();
         self.notification::<lsp_types::DidOpenTextDocumentNotification>(
