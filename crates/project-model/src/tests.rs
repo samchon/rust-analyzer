@@ -9,6 +9,7 @@ use paths::{AbsPath, AbsPathBuf, Utf8Path, Utf8PathBuf};
 use rustc_hash::FxHashMap;
 use serde::de::DeserializeOwned;
 use span::FileId;
+use triomphe::Arc;
 
 use crate::{
     CargoWorkspace, CfgOverrides, ManifestPath, ProjectJson, ProjectJsonData, ProjectWorkspace,
@@ -43,6 +44,7 @@ fn load_workspace_from_metadata(file: &str) -> ProjectWorkspace {
             error: None,
         },
         graph_lockfile: None,
+        graph_project_inputs: Vec::new(),
         graph_rustc_version: Ok("test-rustc".into()),
         cfg_overrides: Default::default(),
         sysroot: Sysroot::empty(),
@@ -54,6 +56,19 @@ fn load_workspace_from_metadata(file: &str) -> ProjectWorkspace {
     }
 }
 
+#[test]
+fn graph_project_inputs_participate_in_workspace_identity() {
+    let left = load_workspace_from_metadata("hello-world-metadata.json");
+    let mut right = left.clone();
+    right.graph_project_inputs.push((
+        AbsPathBuf::assert_utf8(std::env::current_dir().unwrap().join("Cargo.toml")),
+        Some(Arc::from(&b"[workspace]\n"[..])),
+    ));
+
+    assert!(!left.eq_ignore_build_data(&right));
+    assert_ne!(left.graph_semantic_descriptor(), right.graph_semantic_descriptor());
+}
+
 fn load_rust_project(file: &str) -> (CrateGraphBuilder, ProcMacroPaths) {
     let data = get_test_json_file(file);
     let project = rooted_project_json(data);
@@ -61,6 +76,7 @@ fn load_rust_project(file: &str) -> (CrateGraphBuilder, ProcMacroPaths) {
     let project_workspace = ProjectWorkspace {
         kind: ProjectWorkspaceKind::Json(project),
         graph_lockfile: None,
+        graph_project_inputs: Vec::new(),
         graph_rustc_version: Ok("test-rustc".into()),
         sysroot,
         rustc_cfg: Vec::new(),
@@ -90,6 +106,7 @@ fn non_cargo_crates_receive_workspace_distinct_graph_identities() {
     let detached_workspace = ProjectWorkspace {
         kind: ProjectWorkspaceKind::DetachedFile { file: detached.clone(), cargo: None },
         graph_lockfile: None,
+        graph_project_inputs: Vec::new(),
         graph_rustc_version: Ok("test-rustc".into()),
         sysroot: Sysroot::empty(),
         rustc_cfg: Vec::new(),
@@ -311,6 +328,7 @@ fn smoke_test_real_sysroot_cargo() {
             error: None,
         },
         graph_lockfile: None,
+        graph_project_inputs: Vec::new(),
         graph_rustc_version: Ok("test-rustc".into()),
         sysroot,
         rustc_cfg: Vec::new(),

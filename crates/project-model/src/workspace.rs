@@ -3,7 +3,12 @@
 //! database -- `CrateGraph`.
 
 use std::thread::Builder;
-use std::{collections::VecDeque, fmt, fs, iter, ops::Deref, sync, thread};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    fmt, fs, iter,
+    ops::Deref,
+    sync, thread,
+};
 
 use anyhow::Context;
 use base_db::{
@@ -57,6 +62,10 @@ pub struct ProjectWorkspace {
     /// Cargo.lock bytes captured with the project model, never re-read by a
     /// semantic snapshot after this workspace revision is published.
     pub graph_lockfile: Option<Arc<[u8]>>,
+    /// Exact project/build input bytes captured with the project model. Missing
+    /// optional inputs are retained as `None`, so later creation also moves the
+    /// graph universe.
+    pub graph_project_inputs: Vec<(AbsPathBuf, Option<Arc<[u8]>>)>,
     /// Exact rustc identity captured while the project model is loaded.
     pub graph_rustc_version: Result<Arc<str>, Arc<str>>,
     /// The sysroot loaded for this workspace.
@@ -119,6 +128,7 @@ impl fmt::Debug for ProjectWorkspace {
         let Self {
             kind,
             graph_lockfile: _,
+            graph_project_inputs: _,
             graph_rustc_version: _,
             sysroot,
             rustc_cfg,
@@ -465,6 +475,13 @@ impl ProjectWorkspace {
 
         let graph_rustc_version =
             graph_input(version::rustc_verbose(&sysroot, workspace_dir, extra_env));
+        let graph_project_inputs = capture_graph_project_inputs(
+            workspace_dir,
+            cargo.packages().filter_map(|package| {
+                let package = &cargo[package];
+                package.is_member.then(|| AbsPathBuf::from(package.manifest.clone()))
+            }),
+        );
         Ok(ProjectWorkspace {
             kind: ProjectWorkspaceKind::Cargo {
                 cargo,
@@ -473,6 +490,7 @@ impl ProjectWorkspace {
                 error: error.map(Arc::new),
             },
             graph_lockfile: fs::read(workspace_dir.join("Cargo.lock")).ok().map(Arc::from),
+            graph_project_inputs,
             graph_rustc_version,
             sysroot,
             rustc_cfg,
@@ -550,9 +568,14 @@ impl ProjectWorkspace {
             project_json.project_root(),
             &config.extra_env,
         ));
+        let graph_project_inputs = capture_graph_project_inputs(
+            project_json.project_root(),
+            project_json.manifest().map(|manifest| AbsPathBuf::from(manifest.clone())).into_iter(),
+        );
         ProjectWorkspace {
             kind: ProjectWorkspaceKind::Json(project_json),
             graph_lockfile: None,
+            graph_project_inputs,
             graph_rustc_version,
             sysroot,
             rustc_cfg,
@@ -629,12 +652,14 @@ impl ProjectWorkspace {
 
         let graph_rustc_version =
             graph_input(version::rustc_verbose(&sysroot, dir, &config.extra_env));
+        let graph_project_inputs = capture_graph_project_inputs(dir, std::iter::empty());
         Ok(ProjectWorkspace {
             kind: ProjectWorkspaceKind::DetachedFile {
                 file: detached_file.to_owned(),
                 cargo: cargo_script,
             },
             graph_lockfile: fs::read(dir.join("Cargo.lock")).ok().map(Arc::from),
+            graph_project_inputs,
             graph_rustc_version,
             sysroot,
             rustc_cfg,
@@ -753,6 +778,7 @@ impl ProjectWorkspace {
     /// semantic snapshot to this exact project-model universe.
     pub fn graph_semantic_descriptor(&self) -> String {
         let common = (
+            &self.graph_project_inputs,
             &self.sysroot,
             &self.rustc_cfg,
             &self.toolchain,
@@ -1084,6 +1110,7 @@ impl ProjectWorkspace {
             rustc_cfg,
             toolchain,
             graph_rustc_version,
+            graph_project_inputs,
             target: target_layout,
             cfg_overrides,
             ..
@@ -1094,6 +1121,7 @@ impl ProjectWorkspace {
             rustc_cfg: o_rustc_cfg,
             toolchain: o_toolchain,
             graph_rustc_version: o_graph_rustc_version,
+            graph_project_inputs: o_graph_project_inputs,
             target: o_target_layout,
             cfg_overrides: o_cfg_overrides,
             ..
@@ -1123,6 +1151,7 @@ impl ProjectWorkspace {
             && rustc_cfg == o_rustc_cfg
             && toolchain == o_toolchain
             && graph_rustc_version == o_graph_rustc_version
+            && graph_project_inputs == o_graph_project_inputs
             && target_layout == o_target_layout
             && cfg_overrides == o_cfg_overrides
     }
@@ -1134,6 +1163,24 @@ impl ProjectWorkspace {
     pub fn is_json(&self) -> bool {
         matches!(self.kind, ProjectWorkspaceKind::Json { .. })
     }
+}
+
+fn capture_graph_project_inputs(
+    root: &AbsPath,
+    extra: impl IntoIterator<Item = AbsPathBuf>,
+) -> Vec<(AbsPathBuf, Option<Arc<[u8]>>)> {
+    let paths = ["Cargo.lock", "Cargo.toml", "rust-toolchain", "rust-toolchain.toml"]
+        .into_iter()
+        .map(|file| root.join(file))
+        .chain(extra)
+        .collect::<BTreeSet<_>>();
+    paths
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).ok().map(Arc::from);
+            (path, bytes)
+        })
+        .collect()
 }
 
 #[instrument(skip_all)]

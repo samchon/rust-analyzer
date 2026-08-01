@@ -527,6 +527,15 @@ fn retry_error(message: &str) -> anyhow::Error {
 
 fn validate_project_model_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<()> {
     for workspace in snap.workspaces.iter() {
+        for (path, captured) in &workspace.graph_project_inputs {
+            let current = fs::read(path).ok();
+            if current.as_deref() != captured.as_deref() {
+                return Err(retry_error(&format!(
+                    "{} moved beyond the immutable project model; reload and retry",
+                    path
+                )));
+            }
+        }
         if !matches!(
             workspace.kind,
             ProjectWorkspaceKind::Cargo { .. }
@@ -690,6 +699,12 @@ fn external_graph_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<Vec<Exter
         })
         .collect::<Vec<_>>();
     for workspace in snap.workspaces.iter() {
+        inputs.extend(workspace.graph_project_inputs.iter().filter_map(|(path, bytes)| {
+            bytes.as_ref().map(|_| ExternalGraphInput {
+                identity: format!("project-input={path}"),
+                root: PathBuf::from(path.as_str()),
+            })
+        }));
         let (rustc_path, cargo_path, environment) = match &workspace.kind {
             ProjectWorkspaceKind::Cargo { cargo, .. }
             | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, ..)), .. } => (
@@ -1294,6 +1309,13 @@ fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse>
             "workspace-descriptor-sha256={}",
             digest_bytes(workspace.graph_semantic_descriptor().as_bytes())
         ));
+        configurations.extend(workspace.graph_project_inputs.iter().map(|(path, bytes)| {
+            format!(
+                "project-input={};sha256={}",
+                normalize_path(path.as_str()),
+                bytes.as_deref().map(digest_bytes).unwrap_or_else(|| "missing".to_owned())
+            )
+        }));
         configurations.push(format!(
             "cargo-lock-sha256={}",
             workspace
