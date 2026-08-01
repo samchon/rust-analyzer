@@ -1184,6 +1184,7 @@ fn drain_external_input_events_at(cache: &mut GraphSnapshotCache, event_epoch: u
         cache.external_input_event_epoch = event_epoch;
         cache.external_input_revision = cache.external_input_revision.wrapping_add(1);
         cache.external_inputs_dirty = true;
+        cache.external_input_watcher_stale = true;
         cache.invalidate_all();
     }
 }
@@ -2589,9 +2590,9 @@ mod tests {
         CachedSnapshot, ExternalGraphInput, GraphSnapshotCache, capture_external_inputs,
         checker_disk_digest, digest_json, drain_external_input_events,
         drain_source_input_events_at, ensure_cache_revision, external_input_event_relevant,
-        external_input_watch_roots, graph_edges_resolve, interfaces_changed,
-        nearest_existing_watch_root, resolve_external_tool_path, response_for, shard_digest,
-        write_canonical_json,
+        external_input_watch_roots, external_input_watcher, graph_edges_resolve,
+        install_external_input_watcher, interfaces_changed, nearest_existing_watch_root,
+        resolve_external_tool_path, response_for, shard_digest, write_canonical_json,
     };
 
     #[test]
@@ -2838,7 +2839,7 @@ mod tests {
         assert_eq!(cache.revision(), revision.wrapping_add(1));
         assert_eq!(cache.external_input_revision, 1);
         assert!(cache.external_inputs_dirty);
-        assert!(!cache.external_input_watcher_stale);
+        assert!(cache.external_input_watcher_stale);
         assert!(cache.full_rebuild);
     }
 
@@ -3008,6 +3009,72 @@ mod tests {
         assert!(!external_input_event_relevant(&unrelated, &targets));
         assert!(!external_input_event_relevant(&broad_directory_metadata, &targets));
         assert!(external_input_event_relevant(&created_parent, &targets));
+    }
+
+    #[test]
+    fn relevant_events_rearm_recreated_directory_inputs() {
+        use std::{sync::Mutex as StdMutex, thread, time::Duration};
+
+        let directory = temp_dir::TempDir::new().unwrap();
+        let input = directory.path().join("input");
+        let retired = directory.path().join("retired");
+        fs::create_dir_all(input.join("nested")).unwrap();
+        fs::write(input.join("nested/lib.rs"), "pub fn before() {}\n").unwrap();
+        let inputs = [ExternalGraphInput {
+            identity: "package".to_owned(),
+            root: input.clone(),
+            optional: false,
+        }];
+        let initial = capture_external_inputs(&inputs).unwrap();
+        let fence = Arc::new(StdMutex::new(0));
+        let watcher = external_input_watcher(
+            &fence,
+            external_input_watch_roots(&inputs, &initial.symlink_watch_roots).unwrap(),
+            initial.event_targets,
+        )
+        .unwrap();
+        let mut cache = GraphSnapshotCache {
+            external_input_watcher: Some(watcher),
+            external_input_event_fence: Arc::clone(&fence),
+            external_input_watcher_stale: false,
+            ..GraphSnapshotCache::default()
+        };
+
+        fs::rename(&input, &retired).unwrap();
+        wait_for_external_event_after(&fence, 0);
+        drain_external_input_events(&mut cache);
+        assert!(cache.external_input_watcher_stale);
+        drop(cache.external_input_watcher.take());
+
+        fs::create_dir_all(input.join("nested")).unwrap();
+        let source = input.join("nested/lib.rs");
+        fs::write(&source, "pub fn recreated() {}\n").unwrap();
+        let capture = capture_external_inputs(&inputs).unwrap();
+        let roots = external_input_watch_roots(&inputs, &capture.symlink_watch_roots).unwrap();
+        let targets = capture.event_targets;
+        let replacement = external_input_watcher(&fence, roots.clone(), targets.clone()).unwrap();
+        let retired_watcher = install_external_input_watcher(
+            &mut cache,
+            Some(replacement),
+            Some(roots),
+            Some(targets),
+        );
+        drop(retired_watcher);
+        assert!(!cache.external_input_watcher_stale);
+
+        let baseline = *fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        fs::write(&source, "pub fn after() {}\n").unwrap();
+        wait_for_external_event_after(&fence, baseline);
+
+        fn wait_for_external_event_after(fence: &Arc<StdMutex<u64>>, baseline: u64) {
+            for _ in 0..100 {
+                if *fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) != baseline {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            panic!("external graph-input watcher did not observe the change");
+        }
     }
 
     #[cfg(unix)]
