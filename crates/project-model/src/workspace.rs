@@ -21,6 +21,7 @@ use intern::{Symbol, sym};
 use paths::{AbsPath, AbsPathBuf, Utf8Path, Utf8PathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use semver::Version;
+use sha2::{Digest as _, Sha256};
 use span::{Edition, FileId};
 use toolchain::Tool;
 use tracing::instrument;
@@ -570,7 +571,7 @@ impl ProjectWorkspace {
         ));
         let graph_project_inputs = capture_graph_project_inputs(
             project_json.project_root(),
-            project_json.manifest().map(|manifest| AbsPathBuf::from(manifest.clone())).into_iter(),
+            project_json.manifest().map(|manifest| AbsPathBuf::from(manifest.clone())),
         );
         ProjectWorkspace {
             kind: ProjectWorkspaceKind::Json(project_json),
@@ -777,8 +778,21 @@ impl ProjectWorkspace {
     /// Deterministic input for consumers that need to fence a serialized
     /// semantic snapshot to this exact project-model universe.
     pub fn graph_semantic_descriptor(&self) -> String {
+        let graph_project_inputs = self
+            .graph_project_inputs
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    path,
+                    bytes
+                        .as_deref()
+                        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+                        .unwrap_or_else(|| "missing".to_owned()),
+                )
+            })
+            .collect::<Vec<_>>();
         let common = (
-            &self.graph_project_inputs,
+            graph_project_inputs,
             &self.sysroot,
             &self.rustc_cfg,
             &self.toolchain,
