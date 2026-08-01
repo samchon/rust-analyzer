@@ -57,6 +57,8 @@ pub struct ProjectWorkspace {
     /// Cargo.lock bytes captured with the project model, never re-read by a
     /// semantic snapshot after this workspace revision is published.
     pub graph_lockfile: Option<Arc<[u8]>>,
+    /// Exact rustc identity captured while the project model is loaded.
+    pub graph_rustc_version: Result<Arc<str>, Arc<str>>,
     /// The sysroot loaded for this workspace.
     pub sysroot: Sysroot,
     /// Holds cfg flags for the current target. We get those by running
@@ -117,6 +119,7 @@ impl fmt::Debug for ProjectWorkspace {
         let Self {
             kind,
             graph_lockfile: _,
+            graph_rustc_version: _,
             sysroot,
             rustc_cfg,
             toolchain,
@@ -171,6 +174,10 @@ impl fmt::Debug for ProjectWorkspace {
                 .finish(),
         }
     }
+}
+
+fn graph_input(result: anyhow::Result<String>) -> Result<Arc<str>, Arc<str>> {
+    result.map(Arc::from).map_err(|error| Arc::from(error.to_string()))
 }
 
 impl ProjectWorkspace {
@@ -456,6 +463,8 @@ impl ProjectWorkspace {
             _ = e.take();
         }
 
+        let graph_rustc_version =
+            graph_input(version::rustc_verbose(&sysroot, workspace_dir, extra_env));
         Ok(ProjectWorkspace {
             kind: ProjectWorkspaceKind::Cargo {
                 cargo,
@@ -464,6 +473,7 @@ impl ProjectWorkspace {
                 error: error.map(Arc::new),
             },
             graph_lockfile: fs::read(workspace_dir.join("Cargo.lock")).ok().map(Arc::from),
+            graph_rustc_version,
             sysroot,
             rustc_cfg,
             cfg_overrides: cfg_overrides.clone(),
@@ -535,9 +545,15 @@ impl ProjectWorkspace {
             sysroot.set_workspace(loaded_sysroot);
         }
 
+        let graph_rustc_version = graph_input(version::rustc_verbose(
+            &sysroot,
+            project_json.project_root(),
+            &config.extra_env,
+        ));
         ProjectWorkspace {
             kind: ProjectWorkspaceKind::Json(project_json),
             graph_lockfile: None,
+            graph_rustc_version,
             sysroot,
             rustc_cfg,
             toolchain,
@@ -611,12 +627,15 @@ impl ProjectWorkspace {
             )
         });
 
+        let graph_rustc_version =
+            graph_input(version::rustc_verbose(&sysroot, dir, &config.extra_env));
         Ok(ProjectWorkspace {
             kind: ProjectWorkspaceKind::DetachedFile {
                 file: detached_file.to_owned(),
                 cargo: cargo_script,
             },
             graph_lockfile: fs::read(dir.join("Cargo.lock")).ok().map(Arc::from),
+            graph_rustc_version,
             sysroot,
             rustc_cfg,
             toolchain,
@@ -737,6 +756,7 @@ impl ProjectWorkspace {
             &self.sysroot,
             &self.rustc_cfg,
             &self.toolchain,
+            &self.graph_rustc_version,
             &self.target,
             &self.cfg_overrides,
             &self.extra_includes,
@@ -1059,13 +1079,21 @@ impl ProjectWorkspace {
 
     pub fn eq_ignore_build_data(&self, other: &Self) -> bool {
         let Self {
-            kind, sysroot, rustc_cfg, toolchain, target: target_layout, cfg_overrides, ..
+            kind,
+            sysroot,
+            rustc_cfg,
+            toolchain,
+            graph_rustc_version,
+            target: target_layout,
+            cfg_overrides,
+            ..
         } = self;
         let Self {
             kind: o_kind,
             sysroot: o_sysroot,
             rustc_cfg: o_rustc_cfg,
             toolchain: o_toolchain,
+            graph_rustc_version: o_graph_rustc_version,
             target: o_target_layout,
             cfg_overrides: o_cfg_overrides,
             ..
@@ -1094,6 +1122,7 @@ impl ProjectWorkspace {
         }) && sysroot == o_sysroot
             && rustc_cfg == o_rustc_cfg
             && toolchain == o_toolchain
+            && graph_rustc_version == o_graph_rustc_version
             && target_layout == o_target_layout
             && cfg_overrides == o_cfg_overrides
     }
@@ -1140,6 +1169,7 @@ fn project_json_to_crate_graph(
             |(
                 idx,
                 Crate {
+                    root_module,
                     display_name,
                     edition,
                     version,
@@ -1227,6 +1257,16 @@ fn project_json_to_crate_graph(
                     },
                     crate_ws_data.clone(),
                 );
+                if !is_sysroot {
+                    crate_graph.set_graph_identity(
+                        crate_graph_crate_id,
+                        Arc::from(format!(
+                            "project-json={};crate-root={}",
+                            project.manifest_or_root(),
+                            root_module
+                        )),
+                    );
+                }
                 debug!(
                     ?crate_graph_crate_id,
                     crate = display_name.as_ref().map(|name| name.canonical_name().as_str()),
@@ -1530,6 +1570,10 @@ fn detached_file_to_crate_graph(
         false,
         Arc::new(detached_file.parent().to_path_buf()),
         crate_ws_data,
+    );
+    crate_graph.set_graph_identity(
+        detached_file_crate,
+        Arc::from(format!("detached-file={detached_file}")),
     );
 
     public_deps.add_to_crate_graph(&mut crate_graph, detached_file_crate);

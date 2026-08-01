@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 use semver::Version;
 use toolchain::Tool;
 
-use crate::{toolchain_info::QueryConfig, utf8_stdout};
+use crate::{Sysroot, toolchain_info::QueryConfig, utf8_stdout};
 
 pub(crate) fn get(
     config: QueryConfig<'_>,
@@ -30,9 +30,23 @@ pub(crate) fn get(
     anyhow::Ok(version)
 }
 
+pub(crate) fn rustc_verbose(
+    sysroot: &Sysroot,
+    current_dir: &paths::AbsPath,
+    extra_env: &FxHashMap<String, Option<String>>,
+) -> Result<String, anyhow::Error> {
+    let mut cmd = sysroot.tool(Tool::Rustc, current_dir, extra_env);
+    cmd.arg("-vV");
+    utf8_stdout(&mut cmd).with_context(|| {
+        format!(
+            "Failed to query exact rustc identity via `{cmd:?}`, is your toolchain setup correctly?"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use paths::{AbsPathBuf, Utf8PathBuf};
+    use paths::{AbsPath, AbsPathBuf, Utf8Path, Utf8PathBuf};
 
     use crate::{ManifestPath, Sysroot};
 
@@ -53,5 +67,10 @@ mod tests {
         let sysroot = Sysroot::empty();
         let cfg = QueryConfig::Rustc(&sysroot, env!("CARGO_MANIFEST_DIR").as_ref());
         assert!(get(cfg, &FxHashMap::default()).is_ok());
+        let current_dir = AbsPath::assert(Utf8Path::new(env!("CARGO_MANIFEST_DIR")));
+        let verbose = rustc_verbose(&sysroot, current_dir, &FxHashMap::default()).unwrap();
+        assert!(verbose.starts_with("rustc "));
+        assert!(verbose.contains("commit-hash:"));
+        assert!(verbose.contains("host:"));
     }
 }

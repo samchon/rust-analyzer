@@ -42,6 +42,7 @@ sha2 = "0.10.9"
 tenthash = "1.1.0"
 num_cpus = "1.17.0"
 mimalloc = { version = "0.1.46", default-features = false, optional = true }
+notify = "8.2.0"
 lsp-server.workspace = true
 smallvec.workspace = true
 tracing.workspace = true
@@ -89,6 +90,7 @@ jemallocator = { version = "0.5.4", package = "tikv-jemallocator", optional = tr
 
 [dev-dependencies]
 expect-test = "1.5.1"
+temp-dir.workspace = true
 xshell.workspace = true
 
 test-utils.workspace = true

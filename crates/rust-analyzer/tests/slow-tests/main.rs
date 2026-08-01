@@ -59,8 +59,13 @@ version = "0.0.0"
 dependency = { path = "dependency" }
 
 //- /src/lib.rs
-pub fn answer() -> u8 { dependency::answer() }
+use dependency::answer as local_answer;
+mod child;
+pub fn answer() -> u8 { local_answer() }
 pub mod nested { pub use super::answer as alias; }
+
+//- /src/child.rs
+pub fn child() -> u8 { super::local_answer() }
 
 //- /dependency/Cargo.toml
 [package]
@@ -133,7 +138,7 @@ pub fn answer() -> u8 { 42 }
 
     server.open_file_with_text(
         "src/lib.rs",
-        "pub fn answer() -> u8 { dependency::answer() + 1 }\npub mod nested { pub use super::answer as alias; }\n"
+        "use dependency::answer as local_answer;\nmod child;\npub fn answer() -> u8 { local_answer() + 1 }\npub mod nested { pub use super::answer as alias; }\n"
             .to_owned(),
     );
     let edited: GraphSnapshotResult =
@@ -146,15 +151,36 @@ pub fn answer() -> u8 { 42 }
     assert_eq!(edited.base_generation.as_deref(), Some(restored.generation.as_str()));
     assert_eq!(edited.upserts.len(), 1);
 
-    server
-        .open_file_with_text("dependency/src/lib.rs", "pub fn answer() -> u8 { 43 }\n".to_owned());
-    let dependency_changed: GraphSnapshotResult =
+    server.change_file_with_text(
+        "src/lib.rs",
+        2,
+        "use dependency::answer as renamed_answer;\nmod child;\npub fn answer() -> u8 { renamed_answer() + 1 }\npub mod nested { pub use super::answer as alias; }\n"
+            .to_owned(),
+    );
+    let import_renamed: GraphSnapshotResult =
         serde_json::from_value(server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams {
             known_generation: Some(edited.generation.clone()),
             checkpoint: None,
         }))
         .unwrap();
-    assert_ne!(dependency_changed.universe.digest, edited.universe.digest);
+    assert_eq!(import_renamed.universe.digest, edited.universe.digest);
+    assert!(import_renamed.upserts.iter().any(|shard| shard.source.ends_with("src/child.rs")));
+
+    server
+        .open_file_with_text("dependency/src/lib.rs", "pub fn answer() -> u8 { 43 }\n".to_owned());
+    let dependency_changed = (0..4)
+        .find_map(|_| {
+            match server.send_request_result::<GraphSnapshotRequest>(GraphSnapshotParams {
+                known_generation: Some(import_renamed.generation.clone()),
+                checkpoint: None,
+            }) {
+                Ok(value) => Some(serde_json::from_value::<GraphSnapshotResult>(value).unwrap()),
+                Err(error) if error.code == lsp_server::ErrorCode::ServerCancelled as i32 => None,
+                Err(error) => panic!("unexpected graph snapshot error: {error:#?}"),
+            }
+        })
+        .expect("graph snapshot remained invalidated after four retries");
+    assert_ne!(dependency_changed.universe.digest, import_renamed.universe.digest);
     assert_eq!(dependency_changed.base_generation, None);
     assert!(!dependency_changed.upserts.is_empty());
 }

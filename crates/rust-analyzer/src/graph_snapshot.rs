@@ -3,15 +3,18 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    path::PathBuf,
     sync::Arc,
     time::Instant,
 };
 
+use crossbeam_channel::Receiver;
 use ide::{
     AssistResolveStrategy, FileId, FileRange, Severity, StaticIndex, StaticReferenceRole,
     StaticRelationKind, SymbolInformationKind, VendoredLibrariesConfig,
 };
-use project_model::{CargoWorkspace, ProjectWorkspaceKind};
+use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use project_model::ProjectWorkspaceKind;
 use rustc_hash::FxHashSet;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -57,6 +60,13 @@ pub(crate) struct GraphSnapshotCache {
     committed: Option<CachedSnapshot>,
     dirty_files: FxHashSet<FileId>,
     full_rebuild: bool,
+    external_inputs: String,
+    external_input_roots: Vec<ExternalGraphInput>,
+    external_input_digest: Result<String, String>,
+    external_input_revision: u64,
+    external_inputs_dirty: bool,
+    external_input_watcher: Option<RecommendedWatcher>,
+    external_input_events: Option<Receiver<()>>,
 }
 
 impl Default for GraphSnapshotCache {
@@ -67,6 +77,13 @@ impl Default for GraphSnapshotCache {
             committed: None,
             dirty_files: FxHashSet::default(),
             full_rebuild: true,
+            external_inputs: String::new(),
+            external_input_roots: Vec::new(),
+            external_input_digest: Ok(digest_bytes(&[])),
+            external_input_revision: 0,
+            external_inputs_dirty: true,
+            external_input_watcher: None,
+            external_input_events: None,
         }
     }
 }
@@ -99,6 +116,10 @@ struct SnapshotResponsePlan {
 }
 
 impl GraphSnapshotCache {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub(crate) fn invalidate_all(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.dirty_files.clear();
@@ -140,6 +161,7 @@ pub(crate) fn handle(
         ));
     }
     let started = Instant::now();
+    ensure_external_inputs(&snap)?;
     validate_project_model_inputs(&snap)?;
     let observed_universe = universe(&snap)?;
     let cached_response = {
@@ -170,7 +192,7 @@ pub(crate) fn handle(
     ) = {
         let cache = snap.graph_snapshot_cache.lock();
         (
-            cache.revision,
+            snap.graph_snapshot_revision,
             cache.dirty_files.iter().copied().collect::<Vec<_>>(),
             cache.full_rebuild,
             cache.committed.as_ref().map(|cached| cached.universe.clone()),
@@ -245,13 +267,20 @@ pub(crate) fn handle(
         ));
     }
     let mut cache = snap.graph_snapshot_cache.lock();
-    if cache.revision != revision {
-        return Err(retry_error(
-            "graph snapshot was invalidated while it was being built; retry the request",
-        ));
-    }
+    ensure_cache_revision(
+        &cache,
+        revision,
+        "graph snapshot was invalidated while it was being built; retry the request",
+    )?;
     if let Some(committed) = cache.current() {
-        let response = response_plan(committed, params.known_generation.as_deref(), true);
+        let mut response = response_plan(committed, params.known_generation.as_deref(), true);
+        response.phases = GraphSnapshotPhases {
+            semantic_millis,
+            shard_millis,
+            encode_millis: elapsed_millis(encode_started),
+            total_millis: elapsed_millis(started),
+            cache_hit: true,
+        };
         drop(cache);
         return Ok(response.into_result());
     }
@@ -428,9 +457,14 @@ fn checkpoint_response(
     if let Some(committed) = cache.current() {
         return Ok(response_plan(committed, params.known_generation.as_deref(), true).into_result());
     }
+    ensure_cache_revision(
+        &cache,
+        snap.graph_snapshot_revision,
+        "graph snapshot was invalidated while validating a checkpoint; retry the request",
+    )?;
     cache.sequence = cache.sequence.wrapping_add(1);
     let cached = CachedSnapshot {
-        revision: cache.revision,
+        revision: snap.graph_snapshot_revision,
         producer: producer(),
         universe: snapshot_universe.clone(),
         sequence: cache.sequence,
@@ -452,6 +486,14 @@ fn checkpoint_response(
 
 fn is_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn ensure_cache_revision(
+    cache: &GraphSnapshotCache,
+    expected: u64,
+    message: &str,
+) -> anyhow::Result<()> {
+    if cache.revision == expected { Ok(()) } else { Err(retry_error(message)) }
 }
 
 fn retry_error(message: &str) -> anyhow::Error {
@@ -549,6 +591,241 @@ fn producer() -> GraphSnapshotProducer {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ExternalGraphInput {
+    identity: String,
+    root: PathBuf,
+}
+
+fn external_graph_inputs(snap: &GlobalStateSnapshot) -> Vec<ExternalGraphInput> {
+    let mut inputs = snap
+        .workspaces
+        .iter()
+        .filter_map(|workspace| match &workspace.kind {
+            ProjectWorkspaceKind::Cargo { cargo, .. }
+            | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, ..)), .. } => Some(cargo),
+            ProjectWorkspaceKind::Json(_)
+            | ProjectWorkspaceKind::DetachedFile { cargo: None, .. } => None,
+        })
+        .flat_map(|cargo| {
+            cargo.packages().filter_map(|package| {
+                let package = &cargo[package];
+                (package.is_local && !package.is_member).then(|| {
+                    let root: &std::path::Path = package.manifest.parent().as_ref();
+                    ExternalGraphInput {
+                        identity: format!("path-package={}:{}", package.id, package.manifest),
+                        root: root.to_path_buf(),
+                    }
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    for workspace in snap.workspaces.iter() {
+        let (rustc_path, cargo_path) = match &workspace.kind {
+            ProjectWorkspaceKind::Cargo { cargo, .. }
+            | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, ..)), .. } => (
+                workspace.sysroot.tool_path(Tool::Rustc, cargo.workspace_root(), cargo.env()),
+                Some(workspace.sysroot.tool_path(Tool::Cargo, cargo.workspace_root(), cargo.env())),
+            ),
+            ProjectWorkspaceKind::Json(_)
+            | ProjectWorkspaceKind::DetachedFile { cargo: None, .. } => (
+                workspace
+                    .sysroot
+                    .root()
+                    .and_then(|root| {
+                        let bin = root.join("bin");
+                        Tool::Rustc.path_in(bin.as_ref())
+                    })
+                    .unwrap_or_else(|| Tool::Rustc.path()),
+                None,
+            ),
+        };
+        let workspace_root: &std::path::Path = workspace.workspace_root().as_ref();
+        let rustc_path: &std::path::Path = rustc_path.as_ref();
+        inputs.push(ExternalGraphInput {
+            identity: format!("rustc={}", rustc_path.to_string_lossy()),
+            root: if rustc_path.is_absolute() {
+                rustc_path.to_path_buf()
+            } else {
+                workspace_root.join(rustc_path)
+            },
+        });
+        if let Some(cargo_path) = cargo_path {
+            let cargo_path: &std::path::Path = cargo_path.as_ref();
+            inputs.push(ExternalGraphInput {
+                identity: format!("cargo={}", cargo_path.to_string_lossy()),
+                root: if cargo_path.is_absolute() {
+                    cargo_path.to_path_buf()
+                } else {
+                    workspace_root.join(cargo_path)
+                },
+            });
+        }
+        if let Some(root) = workspace.sysroot.rust_lib_src_root() {
+            inputs.push(ExternalGraphInput {
+                identity: format!("rust-lib-src={root}"),
+                root: PathBuf::from(root.as_str()),
+            });
+        }
+        let proc_macro_server = snap
+            .config
+            .proc_macro_srv()
+            .or_else(|| workspace.find_sysroot_proc_macro_srv().and_then(Result::ok));
+        if let Some(server) = proc_macro_server {
+            inputs.push(ExternalGraphInput {
+                identity: format!("proc-macro-server={server}"),
+                root: PathBuf::from(server.as_str()),
+            });
+        }
+    }
+    inputs.sort();
+    inputs.dedup();
+    inputs
+}
+
+fn ensure_external_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<()> {
+    let input_fingerprint = digest_json(&json!({
+        "workspaces": snap
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.graph_semantic_descriptor())
+            .collect::<Vec<_>>(),
+        "procMacroServer": snap.config.proc_macro_srv().map(|path| path.to_string()),
+    }))?;
+
+    let cached_inputs = {
+        let mut cache = snap.graph_snapshot_cache.lock();
+        drain_external_input_events(&mut cache);
+        (cache.external_inputs == input_fingerprint && cache.external_input_watcher.is_some())
+            .then(|| cache.external_input_roots.clone())
+    };
+    let inputs = if let Some(inputs) = cached_inputs {
+        inputs
+    } else {
+        let inputs = external_graph_inputs(snap);
+        let (event_sender, event_receiver) = crossbeam_channel::bounded(1);
+        let mut watcher = RecommendedWatcher::new(
+            move |event: notify::Result<notify::Event>| {
+                if event.as_ref().is_ok_and(|event| matches!(event.kind, EventKind::Access(_))) {
+                    return;
+                }
+                let _ = event_sender.try_send(());
+            },
+            NotifyConfig::default().with_follow_symlinks(true),
+        )
+        .map_err(|error| {
+            retry_error(&format!(
+                "external graph-input watcher could not start: {error}; retry the request"
+            ))
+        })?;
+        for root in inputs.iter().map(|input| &input.root).collect::<BTreeSet<_>>() {
+            let mode = if fs::metadata(root)
+                .map_err(|error| {
+                    retry_error(&format!(
+                        "external graph input {} is unavailable: {error}; retry the request",
+                        root.display()
+                    ))
+                })?
+                .is_dir()
+            {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+            watcher.watch(root, mode).map_err(|error| {
+                retry_error(&format!(
+                    "external graph input {} could not be watched: {error}; retry the request",
+                    root.display()
+                ))
+            })?;
+        }
+        let mut cache = snap.graph_snapshot_cache.lock();
+        cache.external_inputs = input_fingerprint.clone();
+        cache.external_input_roots = inputs.clone();
+        cache.external_inputs_dirty = true;
+        cache.external_input_watcher = Some(watcher);
+        cache.external_input_events = Some(event_receiver);
+        inputs
+    };
+
+    let revision = {
+        let cache = snap.graph_snapshot_cache.lock();
+        if !cache.external_inputs_dirty {
+            return cache.external_input_digest.clone().map(|_| ()).map_err(|error| {
+                retry_error(&format!(
+                    "external graph inputs are unavailable: {error}; retry the request"
+                ))
+            });
+        }
+        cache.external_input_revision
+    };
+    let digest = external_inputs_digest(&inputs);
+    let mut cache = snap.graph_snapshot_cache.lock();
+    drain_external_input_events(&mut cache);
+    if cache.external_inputs != input_fingerprint || cache.external_input_revision != revision {
+        return Err(retry_error(
+            "external graph inputs moved while they were being captured; retry the request",
+        ));
+    }
+    match digest {
+        Ok(digest) => {
+            cache.external_input_digest = Ok(digest);
+            cache.external_inputs_dirty = false;
+            Ok(())
+        }
+        Err(error) => {
+            cache.external_input_digest = Err(error.to_string());
+            cache.external_inputs_dirty = true;
+            Err(retry_error(&format!(
+                "external graph inputs could not be captured: {error}; retry the request"
+            )))
+        }
+    }
+}
+
+fn drain_external_input_events(cache: &mut GraphSnapshotCache) {
+    let changed = cache
+        .external_input_events
+        .as_ref()
+        .is_some_and(|events| events.try_iter().next().is_some());
+    if changed {
+        cache.external_input_revision = cache.external_input_revision.wrapping_add(1);
+        cache.external_inputs_dirty = true;
+        cache.invalidate_all();
+    }
+}
+
+fn external_inputs_digest(inputs: &[ExternalGraphInput]) -> anyhow::Result<String> {
+    let mut content = Vec::<(String, Vec<u8>)>::new();
+    for input in inputs {
+        for entry in WalkDir::new(&input.root).follow_links(true) {
+            let entry = entry.map_err(anyhow::Error::from)?;
+            let path = entry.path();
+            let relative = path.strip_prefix(&input.root).unwrap_or(path);
+            let key =
+                format!("{}:{}", input.identity, relative.to_string_lossy().replace('\\', "/"));
+            if entry.path_is_symlink() {
+                content.push((
+                    format!("{key}:symlink"),
+                    fs::read_link(path)?.to_string_lossy().as_bytes().to_vec(),
+                ));
+            }
+            if entry.file_type().is_file() {
+                content.push((format!("{key}:file"), fs::read(path)?));
+            }
+        }
+    }
+    content.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut digest = Sha256::new();
+    for (key, bytes) in content {
+        digest.update((key.len() as u64).to_le_bytes());
+        digest.update(key.as_bytes());
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse> {
     let mut workspace_roots = snap
         .workspaces
@@ -603,6 +880,13 @@ fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse>
                 .unwrap_or_else(|| "sysroot-or-unavailable".to_owned())
         ),
     ];
+    let external_input_digest =
+        snap.graph_snapshot_cache.lock().external_input_digest.clone().map_err(|error| {
+            retry_error(&format!(
+                "external graph inputs are unavailable: {error}; retry the request"
+            ))
+        })?;
+    configurations.push(format!("external-inputs-sha256={external_input_digest}"));
     for workspace in snap.workspaces.iter() {
         configurations.push(format!(
             "workspace-descriptor-sha256={}",
@@ -620,25 +904,15 @@ fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse>
         configurations.extend(workspace.rustc_cfg.iter().map(|cfg| format!("cfg={cfg:?}")));
         configurations.push(format!("cfg-overrides={:?}", workspace.cfg_overrides));
         configurations.push(format!("set-test={}", workspace.set_test));
+        let rustc_version = workspace.graph_rustc_version.as_ref().map_err(|error| {
+            retry_error(&format!(
+                "exact rustc identity was unavailable in the project model: {error}; reload and retry"
+            ))
+        })?;
+        configurations.push(format!("rustc-version={rustc_version}"));
         if let ProjectWorkspaceKind::Cargo { cargo, .. }
         | ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, ..)), .. } = &workspace.kind
         {
-            let cargo_path =
-                workspace.sysroot.tool_path(Tool::Cargo, cargo.workspace_root(), cargo.env());
-            let rustc_path =
-                workspace.sysroot.tool_path(Tool::Rustc, cargo.workspace_root(), cargo.env());
-            configurations.push(format!("cargo-path={}", normalize_path(cargo_path.as_str())));
-            configurations.push(format!("rustc-path={}", normalize_path(rustc_path.as_str())));
-            configurations.push(format!(
-                "rustc-version={}",
-                workspace
-                    .toolchain
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "unavailable".to_owned())
-            ));
-            configurations
-                .push(format!("path-dependencies-sha256={}", path_dependency_digest(cargo)?));
             for package in cargo.packages() {
                 let package = &cargo[package];
                 let mut features = package.active_features.clone();
@@ -694,43 +968,6 @@ fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse>
         toolchains,
         configurations,
     })
-}
-
-fn path_dependency_digest(cargo: &CargoWorkspace) -> anyhow::Result<String> {
-    let mut inputs = Vec::new();
-    for package in cargo.packages() {
-        let package = &cargo[package];
-        if !package.is_local || package.is_member {
-            continue;
-        }
-        let root = package.manifest.parent();
-        let root_path: &std::path::Path = root.as_ref();
-        for entry in WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| !matches!(entry.file_name().to_str(), Some(".git" | "target")))
-        {
-            let entry = entry.map_err(|error| anyhow::format_err!(error))?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let relative = path.strip_prefix(root_path).unwrap_or(path);
-            inputs.push((
-                format!("{}:{}", package.name, relative.to_string_lossy().replace('\\', "/")),
-                fs::read(path)?,
-            ));
-        }
-    }
-    inputs.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut digest = Sha256::new();
-    for (path, bytes) in inputs {
-        digest.update(path.len().to_le_bytes());
-        digest.update(path.as_bytes());
-        digest.update(bytes.len().to_le_bytes());
-        digest.update(bytes);
-    }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn cargo_profile(extra_args: &[String]) -> String {
@@ -808,6 +1045,7 @@ fn compute_interface_fingerprints(
                 source_entries.push(canonical_json(&json!({
                     "role": reference_kind(reference.role),
                     "target": token.stable_id,
+                    "spelling": reference.interface_spelling,
                     "export": reference.export.as_ref().map(|export| json!({
                         "exporter": export.exporter,
                         "aliasId": export.alias_id,
@@ -844,7 +1082,9 @@ fn interfaces_changed(
     current: &BTreeMap<String, String>,
     dirty_sources: &BTreeSet<String>,
 ) -> bool {
-    dirty_sources.iter().any(|source| cached.get(source) != current.get(source))
+    dirty_sources
+        .iter()
+        .any(|source| !cached.contains_key(source) || cached.get(source) != current.get(source))
 }
 
 #[derive(Default)]
@@ -1526,6 +1766,7 @@ fn elapsed_millis(started: Instant) -> u64 {
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
+        fs,
         sync::Arc,
     };
 
@@ -1538,8 +1779,9 @@ mod tests {
     };
 
     use super::{
-        CachedSnapshot, GraphSnapshotCache, digest_json, interfaces_changed, response_for,
-        shard_digest, write_canonical_json,
+        CachedSnapshot, ExternalGraphInput, GraphSnapshotCache, digest_json,
+        drain_external_input_events, ensure_cache_revision, external_inputs_digest,
+        interfaces_changed, response_for, shard_digest, write_canonical_json,
     };
 
     #[test]
@@ -1692,5 +1934,91 @@ mod tests {
 
         assert!(!interfaces_changed(&cached, &current, &BTreeSet::from(["src/a.rs".to_owned()]),));
         assert!(interfaces_changed(&cached, &current, &BTreeSet::from(["src/b.rs".to_owned()]),));
+        assert!(interfaces_changed(
+            &cached,
+            &current,
+            &BTreeSet::from(["path-dependency/src/lib.rs".to_owned()]),
+        ));
+    }
+
+    #[test]
+    fn checkpoint_install_refuses_a_revision_invalidated_after_snapshot_capture() {
+        let mut cache = GraphSnapshotCache::default();
+        let captured = cache.revision();
+        cache.revision = cache.revision.wrapping_add(1);
+        cache.dirty_files.insert(FileId::from_raw(7));
+        cache.full_rebuild = false;
+        let dirty = cache.dirty_files.clone();
+        let full_rebuild = cache.full_rebuild;
+
+        let error =
+            ensure_cache_revision(&cache, captured, "checkpoint raced an edit").unwrap_err();
+        assert!(error.to_string().contains("checkpoint raced an edit"));
+        assert_eq!(cache.dirty_files, dirty);
+        assert_eq!(cache.full_rebuild, full_rebuild);
+    }
+
+    #[test]
+    fn external_input_events_invalidate_resident_snapshots_once_drained() {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let mut cache = GraphSnapshotCache {
+            full_rebuild: false,
+            external_inputs_dirty: false,
+            external_input_events: Some(receiver),
+            ..GraphSnapshotCache::default()
+        };
+        let revision = cache.revision();
+        sender.send(()).unwrap();
+
+        drain_external_input_events(&mut cache);
+
+        assert_eq!(cache.revision(), revision.wrapping_add(1));
+        assert_eq!(cache.external_input_revision, 1);
+        assert!(cache.external_inputs_dirty);
+        assert!(cache.full_rebuild);
+    }
+
+    #[test]
+    fn external_input_digest_covers_hidden_generated_and_identity_inputs() {
+        let directory = temp_dir::TempDir::new().unwrap();
+        let root = directory.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("src.rs"), "pub fn source() {}\n").unwrap();
+        fs::write(root.join(".git/config"), "semantic-input-a\n").unwrap();
+        fs::write(root.join("target/generated.rs"), "pub const GENERATED: u8 = 1;\n").unwrap();
+
+        let dependency = |identity: &str| ExternalGraphInput {
+            identity: identity.to_owned(),
+            root: root.clone(),
+        };
+        let initial = external_inputs_digest(&[dependency("package-a")]).unwrap();
+        fs::write(root.join(".git/config"), "semantic-input-b\n").unwrap();
+        let hidden = external_inputs_digest(&[dependency("package-a")]).unwrap();
+        fs::write(root.join("target/generated.rs"), "pub const GENERATED: u8 = 2;\n").unwrap();
+        let generated = external_inputs_digest(&[dependency("package-a")]).unwrap();
+        let renamed_package = external_inputs_digest(&[dependency("package-b")]).unwrap();
+
+        assert_ne!(initial, hidden);
+        assert_ne!(hidden, generated);
+        assert_ne!(generated, renamed_package);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_input_digest_follows_symlinked_inputs() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temp_dir::TempDir::new().unwrap();
+        let root = directory.path().to_path_buf();
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::write(root.join("real/generated.rs"), "pub const GENERATED: u8 = 1;\n").unwrap();
+        symlink(root.join("real"), root.join("linked")).unwrap();
+        let dependencies =
+            [ExternalGraphInput { identity: "package".to_owned(), root: root.clone() }];
+        let initial = external_inputs_digest(&dependencies).unwrap();
+        fs::write(root.join("real/generated.rs"), "pub const GENERATED: u8 = 2;\n").unwrap();
+        let changed = external_inputs_digest(&dependencies).unwrap();
+        assert_ne!(initial, changed);
     }
 }

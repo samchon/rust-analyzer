@@ -214,6 +214,7 @@ pub(crate) struct GlobalStateSnapshot {
     mem_docs: MemDocs,
     pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Uri, SemanticTokens>>>,
     pub(crate) graph_snapshot_cache: Arc<Mutex<crate::graph_snapshot::GraphSnapshotCache>>,
+    pub(crate) graph_snapshot_revision: u64,
     vfs: Arc<RwLock<(vfs::Vfs, FxHashMap<FileId, LineEndings>)>>,
     pub(crate) workspaces: Arc<Vec<ProjectWorkspace>>,
     // used to signal semantic highlighting to fall back to syntax based highlighting until
@@ -577,6 +578,7 @@ impl GlobalState {
     }
 
     pub(crate) fn snapshot(&self) -> GlobalStateSnapshot {
+        let graph_snapshot_revision = self.graph_snapshot_cache.lock().revision();
         GlobalStateSnapshot {
             config: Arc::clone(&self.config),
             workspaces: Arc::clone(&self.workspaces),
@@ -587,6 +589,7 @@ impl GlobalState {
             mem_docs: self.mem_docs.clone(),
             semantic_tokens_cache: Arc::clone(&self.semantic_tokens_cache),
             graph_snapshot_cache: Arc::clone(&self.graph_snapshot_cache),
+            graph_snapshot_revision,
             proc_macros_loaded: !self.config.expand_proc_macros()
                 || self.fetch_proc_macros_queue.last_op_result().copied().unwrap_or(false),
             flycheck: self.flycheck.clone(),

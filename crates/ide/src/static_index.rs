@@ -65,6 +65,9 @@ pub struct ReferenceData {
     pub range: FileRange,
     pub is_definition: bool,
     pub role: StaticReferenceRole,
+    /// Exact use-tree syntax that makes import/export alias spelling part of
+    /// the graph interface invalidation fence.
+    pub interface_spelling: Option<String>,
     pub export: Option<StaticExportData>,
 }
 
@@ -524,14 +527,21 @@ fn crate_root_key(db: &RootDatabase, krate: Crate, local: bool) -> String {
 }
 
 fn is_effectively_exported(db: &RootDatabase, def: Definition<'_>) -> bool {
-    if !matches!(def.visibility(db), Some(hir::Visibility::Public)) {
+    if !has_public_visibility_chain(db, def) {
         return false;
     }
     if let Some(item) = def.as_assoc_item(db)
         && let AssocItemContainer::Impl(impl_) = item.container(db)
         && let Some(adt) = impl_.self_ty(db).as_adt()
-        && !matches!(Definition::Adt(adt).visibility(db), Some(hir::Visibility::Public))
+        && !has_public_visibility_chain(db, Definition::Adt(adt))
     {
+        return false;
+    }
+    true
+}
+
+fn has_public_visibility_chain(db: &RootDatabase, def: Definition<'_>) -> bool {
+    if !matches!(def.visibility(db), Some(hir::Visibility::Public)) {
         return false;
     }
     let mut owner = def.enclosing_definition(db);
@@ -932,6 +942,15 @@ impl<'a> StaticIndex<'a> {
                     None => false,
                 },
                 role,
+                interface_spelling: (graph
+                    && matches!(role, StaticReferenceRole::Export | StaticReferenceRole::Import))
+                .then(|| {
+                    scope_node
+                        .ancestors()
+                        .find_map(ast::UseTree::cast)
+                        .map(|tree| tree.syntax().text().to_string())
+                })
+                .flatten(),
                 export,
             });
             result.tokens.push((range, id));
@@ -1561,6 +1580,7 @@ pub fn second(value: (u8,)) -> u8 { value.0 }
 mod private { pub fn hidden() {} }
 pub fn exposed() {}
 pub use private::hidden as alias;
+use private::hidden as local_alias;
 "#,
         );
         let index = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded);
@@ -1583,6 +1603,13 @@ pub use private::hidden as alias;
         assert!(export.qualified_name.ends_with("::alias"));
         assert!(export.exporter.starts_with("rust-hir-v1|"));
         assert!(export.alias_id.starts_with("rust-export-v1|"));
+        assert!(hidden.unwrap().references.iter().any(|reference| {
+            reference.role == super::StaticReferenceRole::Import
+                && reference
+                    .interface_spelling
+                    .as_deref()
+                    .is_some_and(|spelling| spelling.contains("as local_alias"))
+        }));
     }
 
     #[test]
@@ -1592,6 +1619,8 @@ pub use private::hidden as alias;
 //- /workspace/lib.rs crate:main
 struct Private;
 impl Private { pub fn hidden() {} }
+mod private { pub struct Nested; }
+impl private::Nested { pub fn nested_hidden() {} }
 pub struct Public;
 impl Public { pub fn exposed() {} }
 "#,
@@ -1603,6 +1632,13 @@ impl Public { pub fn exposed() {} }
             !tokens
                 .iter()
                 .find(|token| token.display_name.as_deref() == Some("hidden"))
+                .unwrap()
+                .exported
+        );
+        assert!(
+            !tokens
+                .iter()
+                .find(|token| token.display_name.as_deref() == Some("nested_hidden"))
                 .unwrap()
                 .exported
         );

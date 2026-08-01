@@ -93,6 +93,7 @@ impl Tester {
                 cargo: None,
             },
             graph_lockfile: None,
+            graph_rustc_version: Ok("test-rustc".into()),
             sysroot,
             rustc_cfg: vec![],
             toolchain: None,

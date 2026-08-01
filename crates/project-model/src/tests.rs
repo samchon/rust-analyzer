@@ -43,6 +43,7 @@ fn load_workspace_from_metadata(file: &str) -> ProjectWorkspace {
             error: None,
         },
         graph_lockfile: None,
+        graph_rustc_version: Ok("test-rustc".into()),
         cfg_overrides: Default::default(),
         sysroot: Sysroot::empty(),
         rustc_cfg: Vec::new(),
@@ -60,6 +61,7 @@ fn load_rust_project(file: &str) -> (CrateGraphBuilder, ProcMacroPaths) {
     let project_workspace = ProjectWorkspace {
         kind: ProjectWorkspaceKind::Json(project),
         graph_lockfile: None,
+        graph_rustc_version: Ok("test-rustc".into()),
         sysroot,
         rustc_cfg: Vec::new(),
         toolchain: None,
@@ -69,6 +71,42 @@ fn load_rust_project(file: &str) -> (CrateGraphBuilder, ProcMacroPaths) {
         set_test: true,
     };
     to_crate_graph(project_workspace, &mut Default::default())
+}
+
+#[test]
+fn non_cargo_crates_receive_workspace_distinct_graph_identities() {
+    let (project_graph, _) = load_rust_project("hello-world-project.json");
+    let project_identities = project_graph
+        .iter()
+        .filter_map(|krate| project_graph[krate].extra.graph_identity.as_deref())
+        .collect::<Vec<_>>();
+    assert!(!project_identities.is_empty());
+    assert!(project_identities.iter().all(|identity| identity.starts_with("project-json=")));
+
+    let directory = temp_dir::TempDir::new().unwrap();
+    let detached =
+        ManifestPath::try_from(AbsPathBuf::assert_utf8(directory.path().join("standalone.rs")))
+            .unwrap();
+    let detached_workspace = ProjectWorkspace {
+        kind: ProjectWorkspaceKind::DetachedFile { file: detached.clone(), cargo: None },
+        graph_lockfile: None,
+        graph_rustc_version: Ok("test-rustc".into()),
+        sysroot: Sysroot::empty(),
+        rustc_cfg: Vec::new(),
+        toolchain: None,
+        target: Err("test has no target data".into()),
+        cfg_overrides: Default::default(),
+        extra_includes: Vec::new(),
+        set_test: true,
+    };
+    let (detached_graph, _) = to_crate_graph(detached_workspace, &mut Default::default());
+    let identities = detached_graph
+        .iter()
+        .filter_map(|krate| {
+            detached_graph[krate].extra.graph_identity.as_deref().map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(identities, [format!("detached-file={detached}")]);
 }
 
 fn get_test_json_file<T: DeserializeOwned>(file: &str) -> T {
@@ -273,6 +311,7 @@ fn smoke_test_real_sysroot_cargo() {
             error: None,
         },
         graph_lockfile: None,
+        graph_rustc_version: Ok("test-rustc".into()),
         sysroot,
         rustc_cfg: Vec::new(),
         cfg_overrides: Default::default(),
