@@ -933,22 +933,115 @@ fn capture_symlink(
     let relative = path.strip_prefix(&input.root).unwrap_or(path);
     let key = external_input_key(input, relative);
     content.insert(external_input_key_suffix(&key, b"symlink"), path_bytes(&target));
+    let link = canonical_link_identity(path);
+    if let Some(parent) = link.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        insert_watch_root(watch_roots, parent.to_path_buf(), false);
+    }
     let target =
-        if target.is_absolute() { target } else { path.parent().unwrap_or(path).join(target) };
-    match fs::metadata(&target) {
-        Ok(metadata) => {
-            insert_watch_root(watch_roots, target.clone(), metadata.is_dir());
-            if let Some(parent) = target.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-                insert_watch_root(watch_roots, parent.to_path_buf(), false);
+        if target.is_absolute() { target } else { link.parent().unwrap_or(&link).join(target) };
+    capture_symlink_target(target, &key, content, watch_roots, &mut BTreeSet::from([link]))
+}
+
+fn capture_symlink_target(
+    mut target: PathBuf,
+    key: &[u8],
+    content: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+    watch_roots: &mut BTreeMap<PathBuf, bool>,
+    seen: &mut BTreeSet<PathBuf>,
+) -> anyhow::Result<()> {
+    loop {
+        match inspect_symlink_path(&target)? {
+            SymlinkPath::Link { path, suffix } => {
+                let link = canonical_link_identity(&path);
+                if let Some(parent) = link.parent().filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    insert_watch_root(watch_roots, parent.to_path_buf(), false);
+                }
+                if !seen.insert(link.clone()) {
+                    return Ok(());
+                }
+                let raw_target = fs::read_link(&path)?;
+                let mut hop_key = external_input_key_suffix(key, b"symlink-hop");
+                append_key_part(&mut hop_key, &path_bytes(&link));
+                content.insert(hop_key, path_bytes(&raw_target));
+                let next = if raw_target.is_absolute() {
+                    raw_target
+                } else {
+                    link.parent().unwrap_or(&link).join(raw_target)
+                };
+                target = next.join(suffix);
             }
-        }
-        Err(_) => {
-            if let Some(root) = nearest_existing_watch_root(target) {
-                insert_watch_root(watch_roots, root, false);
+            SymlinkPath::Existing { path, directory } => {
+                let path = fs::canonicalize(&path).unwrap_or(path);
+                insert_watch_root(watch_roots, path.clone(), directory);
+                if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    insert_watch_root(watch_roots, parent.to_path_buf(), false);
+                }
+                return Ok(());
+            }
+            SymlinkPath::Missing { path } => {
+                if let Some(root) = nearest_existing_watch_root(path) {
+                    insert_watch_root(watch_roots, root, false);
+                }
+                return Ok(());
             }
         }
     }
-    Ok(())
+}
+
+enum SymlinkPath {
+    Link { path: PathBuf, suffix: PathBuf },
+    Existing { path: PathBuf, directory: bool },
+    Missing { path: PathBuf },
+}
+
+fn inspect_symlink_path(path: &Path) -> anyhow::Result<SymlinkPath> {
+    let mut prefix = PathBuf::new();
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                prefix.pop();
+                continue;
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                prefix.push(component.as_os_str());
+                continue;
+            }
+            std::path::Component::Normal(_) => prefix.push(component.as_os_str()),
+        }
+        match fs::symlink_metadata(&prefix) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Ok(SymlinkPath::Link {
+                    path: prefix,
+                    suffix: components.as_path().to_path_buf(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SymlinkPath::Missing { path: path.to_path_buf() });
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    match fs::metadata(&prefix) {
+        Ok(metadata) => Ok(SymlinkPath::Existing { path: prefix, directory: metadata.is_dir() }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(SymlinkPath::Missing { path: path.to_path_buf() })
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn canonical_link_identity(path: &Path) -> PathBuf {
+    let Some(parent) = path.parent() else { return path.to_path_buf() };
+    let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    match path.file_name() {
+        Some(name) => parent.join(name),
+        None => parent,
+    }
 }
 
 fn external_input_key(input: &ExternalGraphInput, relative: &Path) -> Vec<u8> {
@@ -2222,6 +2315,64 @@ mod tests {
         fs::write(root.join("real/generated.rs"), "pub const GENERATED: u8 = 2;\n").unwrap();
         let changed = capture_external_inputs(&dependencies).unwrap().digest;
         assert_ne!(initial, changed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_input_watcher_follows_symlink_chains_and_indirect_dangling_targets() {
+        use std::{os::unix::fs::symlink, sync::Mutex as StdMutex, thread, time::Duration};
+
+        use super::external_input_watcher;
+
+        let directory = temp_dir::TempDir::new().unwrap();
+        let input = directory.path().join("input");
+        let outside = directory.path().join("outside");
+        let real = directory.path().join("real");
+        let dependency = real.join("dependency");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&dependency).unwrap();
+        fs::write(dependency.join("lib.rs"), "pub fn before() {}\n").unwrap();
+        symlink(&dependency, outside.join("alias")).unwrap();
+        symlink(outside.join("alias"), input.join("link")).unwrap();
+        let inputs = [ExternalGraphInput { identity: "package".to_owned(), root: input.clone() }];
+        let capture = capture_external_inputs(&inputs).unwrap();
+        assert_eq!(capture.symlink_watch_roots.get(&dependency), Some(&true));
+        let fence = Arc::new(StdMutex::new(0));
+        let watcher = external_input_watcher(
+            &fence,
+            external_input_watch_roots(&inputs, &capture.symlink_watch_roots).unwrap(),
+        )
+        .unwrap();
+        fs::write(dependency.join("lib.rs"), "pub fn after() {}\n").unwrap();
+        wait_for_external_event(&fence);
+        drop(watcher);
+
+        fs::remove_file(input.join("link")).unwrap();
+        fs::remove_file(outside.join("alias")).unwrap();
+        symlink(real.join("missing.rs"), outside.join("alias")).unwrap();
+        symlink(outside.join("alias"), input.join("link")).unwrap();
+        let capture = capture_external_inputs(&inputs).unwrap();
+        assert_eq!(capture.symlink_watch_roots.get(&real), Some(&false));
+        let fence = Arc::new(StdMutex::new(0));
+        let watcher = external_input_watcher(
+            &fence,
+            external_input_watch_roots(&inputs, &capture.symlink_watch_roots).unwrap(),
+        )
+        .unwrap();
+        fs::write(real.join("missing.rs"), "pub fn appeared() {}\n").unwrap();
+        wait_for_external_event(&fence);
+        drop(watcher);
+
+        fn wait_for_external_event(fence: &Arc<StdMutex<u64>>) {
+            for _ in 0..100 {
+                if *fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) != 0 {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            panic!("external graph-input watcher did not observe the symlink target change");
+        }
     }
 
     #[cfg(unix)]
