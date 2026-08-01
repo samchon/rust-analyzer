@@ -393,6 +393,9 @@ impl GlobalState {
                             .unwrap_or_default();
 
                         let path = path.to_path_buf();
+                        let is_graph_project_input = self.workspaces.iter().any(|workspace| {
+                            workspace.graph_project_inputs.iter().any(|(input, _)| input == &path)
+                        });
                         if file.is_created_or_deleted() {
                             workspace_structure_change.get_or_insert((path, false)).1 |=
                                 self.crate_graph_file_dependencies.contains(vfs_path);
@@ -400,6 +403,7 @@ impl GlobalState {
                             &path,
                             file.kind(),
                             &additional_files,
+                            is_graph_project_input,
                         ) {
                             trace!(?path, kind = ?file.kind(), "refreshing for a change");
                             workspace_structure_change.get_or_insert((path.clone(), false));

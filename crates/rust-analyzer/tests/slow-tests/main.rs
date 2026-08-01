@@ -59,7 +59,7 @@ version = "0.0.0"
 [dependencies]
 dependency = { path = "dependency" }
 
-//- /.cargo/config.toml
+//- /custom/config.toml
 [build]
 rustflags = []
 
@@ -74,7 +74,7 @@ impl core::fmt::Debug for Root {
         formatter.write_str("Root")
     }
 }
-pub fn answer() -> u8 { local_answer() }
+pub fn answer() -> u8 { local_answer() + dependency::shared_answer() }
 pub mod nested { pub use super::answer as alias; }
 
 //- /src/child.rs
@@ -86,7 +86,7 @@ impl core::fmt::Debug for Leaf {
         formatter.write_str("Leaf")
     }
 }
-pub fn child() -> u8 { super::local_answer() }
+pub fn child() -> u8 { super::local_answer() + dependency::shared_answer() }
 
 //- /dependency/Cargo.toml
 [package]
@@ -95,12 +95,18 @@ version = "0.0.0"
 
 //- /dependency/src/lib.rs
 pub fn answer() -> u8 { 42 }
+pub fn shared_answer() -> u8 { 1 }
 pub trait Shared {}
 "#;
     let dir = TestDir::new();
     let restart_dir = dir.shared();
-    let first_server =
-        Project::with_fixture(FIXTURE).tmp_dir(dir).server().wait_until_workspace_is_loaded();
+    let first_server = Project::with_fixture(FIXTURE)
+        .with_config(json!({
+            "cargo": { "extraArgs": ["--config", "custom/config.toml"] },
+        }))
+        .tmp_dir(dir)
+        .server()
+        .wait_until_workspace_is_loaded();
     let first: GraphSnapshotResult = serde_json::from_value(
         first_server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams::default()),
     )
@@ -143,6 +149,9 @@ pub trait Shared {}
     drop(first_server);
 
     let server = Project::with_fixture(FIXTURE)
+        .with_config(json!({
+            "cargo": { "extraArgs": ["--config", "custom/config.toml"] },
+        }))
         .tmp_dir(restart_dir)
         .server()
         .wait_until_workspace_is_loaded();
@@ -167,7 +176,7 @@ pub trait Shared {}
 
     server.open_file_with_text(
         "src/child.rs",
-        "pub trait Child: super::Parent {}\npub struct Leaf;\nimpl dependency::Shared for Leaf {}\nimpl core::fmt::Debug for Leaf { fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { formatter.write_str(\"Leaf\") } }\npub fn child() -> u8 { super::local_answer() + 1 }\n"
+        "pub trait Child: super::Parent {}\npub struct Leaf;\nimpl dependency::Shared for Leaf {}\nimpl core::fmt::Debug for Leaf { fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { formatter.write_str(\"Leaf\") } }\npub fn child() -> u8 { super::local_answer() + dependency::shared_answer() + 1 }\n"
             .to_owned(),
     );
     let edited: GraphSnapshotResult =
@@ -198,7 +207,7 @@ pub trait Shared {}
     server.change_file_with_text(
         "src/child.rs",
         2,
-        "pub trait Child: super::Parent {}\npub struct Leaf;\nimpl dependency::Shared for Leaf {}\nimpl core::fmt::Debug for Leaf { fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { formatter.write_str(\"Leaf\") } }\npub fn child() -> u8 { super::local_answer() + 2 }\n"
+        "pub trait Child: super::Parent {}\npub struct Leaf;\nimpl dependency::Shared for Leaf {}\nimpl core::fmt::Debug for Leaf { fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { formatter.write_str(\"Leaf\") } }\npub fn child() -> u8 { super::local_answer() + dependency::shared_answer() + 2 }\n"
             .to_owned(),
     );
     let second_edit: GraphSnapshotResult =
@@ -213,19 +222,48 @@ pub trait Shared {}
 
     server.open_file_with_text(
         "src/lib.rs",
+        "use dependency::answer as local_answer;\nmod child;\npub trait Parent {}\npub struct Root;\nimpl dependency::Shared for Root {}\nimpl core::fmt::Debug for Root { fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { formatter.write_str(\"Root\") } }\npub fn answer() -> u8 { local_answer() }\npub mod nested { pub use super::answer as alias; }\n"
+            .to_owned(),
+    );
+    let body_edited = (0..4)
+        .find_map(|_| {
+            match server.send_request_result::<GraphSnapshotRequest>(GraphSnapshotParams {
+                known_generation: Some(second_edit.generation.clone()),
+                checkpoint: None,
+            }) {
+                Ok(value) => Some(serde_json::from_value::<GraphSnapshotResult>(value).unwrap()),
+                Err(error) if error.code == lsp_server::ErrorCode::ServerCancelled as i32 => None,
+                Err(error) => panic!("unexpected shared external-node recovery error: {error:#?}"),
+            }
+        })
+        .expect("graph snapshot did not rebuild after shared external-node ownership moved");
+    apply_graph_delta(&mut resident_shards, &body_edited);
+    assert_unique_graph_node_ownership(&resident_shards.values().cloned().collect::<Vec<_>>());
+    let shared_answer = resident_shards
+        .values()
+        .flat_map(|shard| &shard.nodes)
+        .find(|node| node.name == "shared_answer")
+        .expect("shared external call target disappeared after its owner shard changed");
+    assert!(resident_shards.values().flat_map(|shard| &shard.edges).any(|edge| {
+        edge.kind == "calls" && edge.to == shared_answer.id && edge.evidence.is_some()
+    }));
+
+    server.change_file_with_text(
+        "src/lib.rs",
+        2,
         "use dependency::answer as renamed_answer;\nmod child;\npub trait Parent {}\npub struct Root;\nimpl dependency::Shared for Root {}\nimpl core::fmt::Debug for Root { fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { formatter.write_str(\"Root\") } }\npub fn answer() -> u8 { renamed_answer() }\npub mod nested { pub use super::answer as alias; }\n"
             .to_owned(),
     );
     let import_renamed: GraphSnapshotResult =
         serde_json::from_value(server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams {
-            known_generation: Some(second_edit.generation.clone()),
+            known_generation: Some(body_edited.generation.clone()),
             checkpoint: None,
         }))
         .unwrap();
     assert_eq!(import_renamed.universe.digest, edited.universe.digest);
     assert!(import_renamed.upserts.iter().any(|shard| shard.source.ends_with("src/child.rs")));
 
-    server.write_watched_file(".cargo/config.toml", "[build\n");
+    server.write_watched_file("custom/config.toml", "[build\n");
     let malformed_rejected = (0..20).any(|_| {
         std::thread::sleep(std::time::Duration::from_millis(50));
         server
@@ -238,7 +276,7 @@ pub trait Shared {}
     assert!(malformed_rejected, "malformed Cargo config did not close the graph snapshot fence");
 
     server.write_watched_file(
-        ".cargo/config.toml",
+        "custom/config.toml",
         "[build]\nrustflags = [\"--cfg\", \"samchon_graph_retry\"]\n",
     );
     let mut last_config_error = None;

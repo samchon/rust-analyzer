@@ -1009,6 +1009,7 @@ pub(crate) fn should_refresh_for_change(
     path: &AbsPath,
     change_kind: ChangeKind,
     additional_paths: &[&str],
+    is_graph_project_input: bool,
 ) -> bool {
     // Note: build scripts are retriggered on file save, no refresh is necessary
     const IMPLICIT_TARGET_FILES: &[&str] = &["build.rs", "src/main.rs", "src/lib.rs"];
@@ -1019,7 +1020,7 @@ pub(crate) fn should_refresh_for_change(
         None => return false,
     };
 
-    if let "Cargo.toml" | "Cargo.lock" = file_name {
+    if is_graph_project_input || matches!(file_name, "Cargo.toml" | "Cargo.lock") {
         return true;
     }
 
@@ -1078,4 +1079,20 @@ fn eq_ignore_underscore(s1: &str, s2: &str) -> bool {
 
         c1 == c2 || (c1_underscore && c2_underscore)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_refresh_for_change;
+    use vfs::{AbsPathBuf, ChangeKind};
+
+    #[test]
+    fn explicit_graph_project_inputs_refresh_outside_dot_cargo() {
+        let path = AbsPathBuf::assert_utf8(
+            std::env::current_dir().unwrap().join("custom/cargo-config.toml"),
+        );
+
+        assert!(!should_refresh_for_change(&path, ChangeKind::Modify, &[], false));
+        assert!(should_refresh_for_change(&path, ChangeKind::Modify, &[], true));
+    }
 }

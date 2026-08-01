@@ -370,6 +370,12 @@ pub(crate) fn handle(
     for shard in built.shards {
         merged.insert(shard.key.clone(), Arc::new(shard));
     }
+    if !graph_edges_resolve(merged.values().map(AsRef::as_ref)) {
+        cache.invalidate_all();
+        return Err(retry_error(
+            "incremental graph ownership moved; retry with a full snapshot rebuild",
+        ));
+    }
 
     let old_manifest = cache
         .committed
@@ -515,6 +521,11 @@ fn checkpoint_response(
                 "persisted graph checkpoint shards are invalid; rebuild and retry",
             ));
         }
+    }
+    if !graph_edges_resolve(shards.values().map(AsRef::as_ref)) {
+        return Err(retry_error(
+            "persisted graph checkpoint contains dangling edge endpoints; rebuild and retry",
+        ));
     }
     if manifest.len() != manifest_count
         || manifest.len() != expected_sources.len()
@@ -1738,6 +1749,19 @@ struct BuiltShards {
     node_owners: BTreeMap<String, String>,
 }
 
+fn graph_edges_resolve<'a>(shards: impl IntoIterator<Item = &'a GraphSnapshotShard>) -> bool {
+    let shards = shards.into_iter().collect::<Vec<_>>();
+    let node_ids = shards
+        .iter()
+        .flat_map(|shard| &shard.nodes)
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    shards
+        .iter()
+        .flat_map(|shard| &shard.edges)
+        .all(|edge| node_ids.contains(edge.from.as_str()) && node_ids.contains(edge.to.as_str()))
+}
+
 fn build_shards(
     snap: &GlobalStateSnapshot,
     index: StaticIndex<'_>,
@@ -2441,16 +2465,16 @@ mod tests {
     use serde_json::json;
 
     use crate::lsp_ext::{
-        GraphSnapshotCoverage, GraphSnapshotManifestEntry, GraphSnapshotPhases,
-        GraphSnapshotProducer, GraphSnapshotShard, GraphSnapshotUniverse,
+        GraphSnapshotCoverage, GraphSnapshotEdge, GraphSnapshotManifestEntry, GraphSnapshotNode,
+        GraphSnapshotPhases, GraphSnapshotProducer, GraphSnapshotShard, GraphSnapshotUniverse,
     };
 
     use super::{
         CachedSnapshot, ExternalGraphInput, GraphSnapshotCache, capture_external_inputs,
         checker_disk_digest, digest_json, drain_external_input_events,
         drain_source_input_events_at, ensure_cache_revision, external_input_watch_roots,
-        interfaces_changed, nearest_existing_watch_root, resolve_external_tool_path, response_for,
-        shard_digest, write_canonical_json,
+        graph_edges_resolve, interfaces_changed, nearest_existing_watch_root,
+        resolve_external_tool_path, response_for, shard_digest, write_canonical_json,
     };
 
     #[test]
@@ -2493,6 +2517,52 @@ mod tests {
         .unwrap();
 
         assert_ne!(left, right);
+    }
+
+    #[test]
+    fn checkpoint_edge_validation_rejects_globally_dangling_endpoints() {
+        let node = GraphSnapshotNode {
+            id: "present".to_owned(),
+            kind: "function".to_owned(),
+            name: "present".to_owned(),
+            qualified_name: None,
+            file: "src/lib.rs".to_owned(),
+            external: false,
+            exported: false,
+            signature: None,
+            evidence: None,
+        };
+        let mut shard = GraphSnapshotShard {
+            key: "target\0src/lib.rs".to_owned(),
+            source: "src/lib.rs".to_owned(),
+            checker_digest: "checker".to_owned(),
+            interface_fingerprint: "interface".to_owned(),
+            digest: "digest".to_owned(),
+            nodes: vec![node],
+            edges: vec![GraphSnapshotEdge {
+                from: "present".to_owned(),
+                to: "missing".to_owned(),
+                kind: "calls".to_owned(),
+                evidence: None,
+            }],
+            diagnostics: Vec::new(),
+            coverage: Vec::new(),
+            unresolved: Vec::new(),
+        };
+
+        assert!(!graph_edges_resolve([&shard]));
+        shard.nodes.push(GraphSnapshotNode {
+            id: "missing".to_owned(),
+            kind: "function".to_owned(),
+            name: "missing".to_owned(),
+            qualified_name: None,
+            file: "bundled:///rust/dependencies".to_owned(),
+            external: true,
+            exported: true,
+            signature: None,
+            evidence: None,
+        });
+        assert!(graph_edges_resolve([&shard]));
     }
 
     #[test]
