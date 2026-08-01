@@ -43,7 +43,7 @@ use stdx::format_to_acc;
 use test_utils::skip_slow_tests;
 use testdir::TestDir;
 
-use crate::support::{Project, project};
+use crate::support::{Project, Server, project};
 
 #[test]
 fn graph_snapshot_checkpoint_restores_resident_incremental_state() {
@@ -107,10 +107,11 @@ pub trait Shared {}
         .tmp_dir(dir)
         .server()
         .wait_until_workspace_is_loaded();
-    let first: GraphSnapshotResult = serde_json::from_value(
-        first_server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams::default()),
-    )
-    .unwrap();
+    let first = request_graph_snapshot(
+        &first_server,
+        GraphSnapshotParams::default(),
+        "initial graph snapshot",
+    );
     assert_unique_graph_node_ownership(&first.upserts);
     let mut resident_shards = first
         .upserts
@@ -155,22 +156,26 @@ pub trait Shared {}
         .tmp_dir(restart_dir)
         .server()
         .wait_until_workspace_is_loaded();
-    let restored: GraphSnapshotResult =
-        serde_json::from_value(server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams {
+    let restored = request_graph_snapshot(
+        &server,
+        GraphSnapshotParams {
             known_generation: Some(first.generation.clone()),
             checkpoint: Some(checkpoint),
-        }))
-        .unwrap();
+        },
+        "checkpoint restore",
+    );
     assert!(restored.phases.cache_hit);
     assert_eq!(restored.generation, first.generation);
     assert!(restored.upserts.is_empty());
 
-    let resident: GraphSnapshotResult =
-        serde_json::from_value(server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams {
+    let resident = request_graph_snapshot(
+        &server,
+        GraphSnapshotParams {
             known_generation: Some(restored.generation.clone()),
             checkpoint: None,
-        }))
-        .unwrap();
+        },
+        "resident no-op",
+    );
     assert!(resident.phases.cache_hit);
     assert!(resident.upserts.is_empty());
 
@@ -179,12 +184,14 @@ pub trait Shared {}
         "pub trait Child: super::Parent {}\npub struct Leaf;\nimpl dependency::Shared for Leaf {}\nimpl core::fmt::Debug for Leaf { fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { formatter.write_str(\"Leaf\") } }\npub fn child() -> u8 { super::local_answer() + dependency::shared_answer() + 1 }\n"
             .to_owned(),
     );
-    let edited: GraphSnapshotResult =
-        serde_json::from_value(server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams {
+    let edited = request_graph_snapshot(
+        &server,
+        GraphSnapshotParams {
             known_generation: Some(restored.generation.clone()),
             checkpoint: None,
-        }))
-        .unwrap();
+        },
+        "first body edit",
+    );
     assert!(!edited.phases.cache_hit);
     assert_eq!(edited.base_generation.as_deref(), Some(restored.generation.as_str()));
     assert_eq!(edited.upserts.len(), 1);
@@ -210,12 +217,11 @@ pub trait Shared {}
         "pub trait Child: super::Parent {}\npub struct Leaf;\nimpl dependency::Shared for Leaf {}\nimpl core::fmt::Debug for Leaf { fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { formatter.write_str(\"Leaf\") } }\npub fn child() -> u8 { super::local_answer() + dependency::shared_answer() + 2 }\n"
             .to_owned(),
     );
-    let second_edit: GraphSnapshotResult =
-        serde_json::from_value(server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams {
-            known_generation: Some(edited.generation.clone()),
-            checkpoint: None,
-        }))
-        .unwrap();
+    let second_edit = request_graph_snapshot(
+        &server,
+        GraphSnapshotParams { known_generation: Some(edited.generation.clone()), checkpoint: None },
+        "second body edit",
+    );
     assert_eq!(second_edit.upserts.len(), 1);
     apply_graph_delta(&mut resident_shards, &second_edit);
     assert_unique_graph_node_ownership(&resident_shards.values().cloned().collect::<Vec<_>>());
@@ -225,18 +231,14 @@ pub trait Shared {}
         "use dependency::answer as local_answer;\nmod child;\npub trait Parent {}\npub struct Root;\nimpl dependency::Shared for Root {}\nimpl core::fmt::Debug for Root { fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { formatter.write_str(\"Root\") } }\npub fn answer() -> u8 { local_answer() }\npub mod nested { pub use super::answer as alias; }\n"
             .to_owned(),
     );
-    let body_edited = (0..4)
-        .find_map(|_| {
-            match server.send_request_result::<GraphSnapshotRequest>(GraphSnapshotParams {
-                known_generation: Some(second_edit.generation.clone()),
-                checkpoint: None,
-            }) {
-                Ok(value) => Some(serde_json::from_value::<GraphSnapshotResult>(value).unwrap()),
-                Err(error) if error.code == lsp_server::ErrorCode::ServerCancelled as i32 => None,
-                Err(error) => panic!("unexpected shared external-node recovery error: {error:#?}"),
-            }
-        })
-        .expect("graph snapshot did not rebuild after shared external-node ownership moved");
+    let body_edited = request_graph_snapshot(
+        &server,
+        GraphSnapshotParams {
+            known_generation: Some(second_edit.generation.clone()),
+            checkpoint: None,
+        },
+        "shared external-node ownership recovery",
+    );
     apply_graph_delta(&mut resident_shards, &body_edited);
     assert_unique_graph_node_ownership(&resident_shards.values().cloned().collect::<Vec<_>>());
     let shared_answer = resident_shards
@@ -254,12 +256,14 @@ pub trait Shared {}
         "use dependency::answer as renamed_answer;\nmod child;\npub trait Parent {}\npub struct Root;\nimpl dependency::Shared for Root {}\nimpl core::fmt::Debug for Root { fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { formatter.write_str(\"Root\") } }\npub fn answer() -> u8 { renamed_answer() }\npub mod nested { pub use super::answer as alias; }\n"
             .to_owned(),
     );
-    let import_renamed: GraphSnapshotResult =
-        serde_json::from_value(server.send_request::<GraphSnapshotRequest>(GraphSnapshotParams {
+    let import_renamed = request_graph_snapshot(
+        &server,
+        GraphSnapshotParams {
             known_generation: Some(body_edited.generation.clone()),
             checkpoint: None,
-        }))
-        .unwrap();
+        },
+        "import rename",
+    );
     assert_eq!(import_renamed.universe.digest, edited.universe.digest);
     assert!(import_renamed.upserts.iter().any(|shard| shard.source.ends_with("src/child.rs")));
 
@@ -305,21 +309,36 @@ pub trait Shared {}
 
     server
         .open_file_with_text("dependency/src/lib.rs", "pub fn answer() -> u8 { 43 }\n".to_owned());
-    let dependency_changed = (0..4)
-        .find_map(|_| {
-            match server.send_request_result::<GraphSnapshotRequest>(GraphSnapshotParams {
-                known_generation: Some(config_recovered.generation.clone()),
-                checkpoint: None,
-            }) {
-                Ok(value) => Some(serde_json::from_value::<GraphSnapshotResult>(value).unwrap()),
-                Err(error) if error.code == lsp_server::ErrorCode::ServerCancelled as i32 => None,
-                Err(error) => panic!("unexpected graph snapshot error: {error:#?}"),
-            }
-        })
-        .expect("graph snapshot remained invalidated after four retries");
+    let dependency_changed = request_graph_snapshot(
+        &server,
+        GraphSnapshotParams {
+            known_generation: Some(config_recovered.generation.clone()),
+            checkpoint: None,
+        },
+        "dependency universe change",
+    );
     assert_ne!(dependency_changed.universe.digest, config_recovered.universe.digest);
     assert_eq!(dependency_changed.base_generation, None);
     assert!(!dependency_changed.upserts.is_empty());
+}
+
+fn request_graph_snapshot(
+    server: &Server,
+    params: GraphSnapshotParams,
+    context: &str,
+) -> GraphSnapshotResult {
+    let mut last_cancellation = None;
+    for _ in 0..20 {
+        match server.send_request_result::<GraphSnapshotRequest>(params.clone()) {
+            Ok(value) => return serde_json::from_value(value).unwrap(),
+            Err(error) if error.code == lsp_server::ErrorCode::ServerCancelled as i32 => {
+                last_cancellation = Some(error.message);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => panic!("unexpected {context} error: {error:#?}"),
+        }
+    }
+    panic!("{context} did not settle after twenty bounded retries: {last_cancellation:?}");
 }
 
 fn apply_graph_delta(
