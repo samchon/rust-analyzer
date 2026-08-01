@@ -141,7 +141,7 @@ impl RequestDispatcher<'_> {
                 Result: Serialize,
             > + 'static,
     {
-        if !self.global_state.is_graph_snapshot_ready() {
+        if !self.global_state.vfs_done || self.global_state.incomplete_crate_graph {
             if let Some(lsp_server::Request { id, .. }) =
                 self.req.take_if(|it| it.method.as_str() == R::METHOD.as_str())
             {
@@ -152,9 +152,9 @@ impl RequestDispatcher<'_> {
         self.on_with_thread_intent::<false, false, R>(ThreadIntent::Worker, f, on_cancelled)
     }
 
-    /// Dispatches a non-latency-sensitive request only after both the VFS and
-    /// crate graph are ready. Unlike [`Self::on`], an early request receives a
-    /// retryable error instead of a default-constructed success payload.
+    /// Dispatches a graph request only after the complete semantic universe is
+    /// settled. Unlike [`Self::on`], an early request receives a retryable
+    /// error instead of a default-constructed success payload.
     pub(crate) fn on_vfs_ready<const ALLOW_RETRYING: bool, R>(
         &mut self,
         f: fn(GlobalStateSnapshot, R::Params) -> anyhow::Result<R::Result>,
@@ -164,7 +164,7 @@ impl RequestDispatcher<'_> {
         R::Params: DeserializeOwned + panic::UnwindSafe + Send + fmt::Debug,
         R::Result: Serialize,
     {
-        if !self.global_state.vfs_done || self.global_state.incomplete_crate_graph {
+        if !self.global_state.is_graph_snapshot_ready() {
             if let Some(lsp_server::Request { id, .. }) =
                 self.req.take_if(|it| it.method.as_str() == R::METHOD.as_str())
             {

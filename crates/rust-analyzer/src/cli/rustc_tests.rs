@@ -92,6 +92,7 @@ impl Tester {
                 file: ManifestPath::try_from(tmp_file).unwrap(),
                 cargo: None,
             },
+            graph_lockfile: None,
             sysroot,
             rustc_cfg: vec![],
             toolchain: None,

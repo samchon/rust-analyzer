@@ -54,6 +54,9 @@ pub struct PackageRoot {
 #[derive(Clone)]
 pub struct ProjectWorkspace {
     pub kind: ProjectWorkspaceKind,
+    /// Cargo.lock bytes captured with the project model, never re-read by a
+    /// semantic snapshot after this workspace revision is published.
+    pub graph_lockfile: Option<Arc<[u8]>>,
     /// The sysroot loaded for this workspace.
     pub sysroot: Sysroot,
     /// Holds cfg flags for the current target. We get those by running
@@ -113,6 +116,7 @@ impl fmt::Debug for ProjectWorkspace {
         // Make sure this isn't too verbose.
         let Self {
             kind,
+            graph_lockfile: _,
             sysroot,
             rustc_cfg,
             toolchain,
@@ -459,6 +463,7 @@ impl ProjectWorkspace {
                 rustc,
                 error: error.map(Arc::new),
             },
+            graph_lockfile: fs::read(workspace_dir.join("Cargo.lock")).ok().map(Arc::from),
             sysroot,
             rustc_cfg,
             cfg_overrides: cfg_overrides.clone(),
@@ -532,6 +537,7 @@ impl ProjectWorkspace {
 
         ProjectWorkspace {
             kind: ProjectWorkspaceKind::Json(project_json),
+            graph_lockfile: None,
             sysroot,
             rustc_cfg,
             toolchain,
@@ -610,6 +616,7 @@ impl ProjectWorkspace {
                 file: detached_file.to_owned(),
                 cargo: cargo_script,
             },
+            graph_lockfile: fs::read(dir.join("Cargo.lock")).ok().map(Arc::from),
             sysroot,
             rustc_cfg,
             toolchain,

@@ -23,10 +23,10 @@ use crate::{
     global_state::GlobalStateSnapshot,
     lsp::to_proto,
     lsp_ext::{
-        GraphSnapshotCoverage, GraphSnapshotDiagnostic, GraphSnapshotEdge, GraphSnapshotEvidence,
-        GraphSnapshotManifestEntry, GraphSnapshotNode, GraphSnapshotParams, GraphSnapshotPhases,
-        GraphSnapshotProducer, GraphSnapshotResult, GraphSnapshotShard, GraphSnapshotUniverse,
-        GraphSnapshotUnresolved,
+        GraphSnapshotCheckpoint, GraphSnapshotCoverage, GraphSnapshotDiagnostic, GraphSnapshotEdge,
+        GraphSnapshotEvidence, GraphSnapshotManifestEntry, GraphSnapshotNode, GraphSnapshotParams,
+        GraphSnapshotPhases, GraphSnapshotProducer, GraphSnapshotResult, GraphSnapshotShard,
+        GraphSnapshotUniverse, GraphSnapshotUnresolved,
     },
 };
 
@@ -134,14 +134,22 @@ pub(crate) fn handle(
         ));
     }
     let started = Instant::now();
+    validate_project_model_inputs(&snap)?;
+    let observed_universe = universe(&snap)?;
     let cached_response = {
-        let cache = snap.graph_snapshot_cache.lock();
+        let mut cache = snap.graph_snapshot_cache.lock();
+        if cache.committed.as_ref().is_some_and(|cached| cached.universe != observed_universe) {
+            cache.invalidate_all();
+        }
         cache
             .current()
             .map(|cached| response_plan(cached, params.known_generation.as_deref(), true))
     };
     if let Some(response) = cached_response {
         return Ok(response.into_result());
+    }
+    if let Some(checkpoint) = params.checkpoint.as_ref() {
+        return checkpoint_response(&snap, &observed_universe, checkpoint, &params);
     }
     let (
         revision,
@@ -205,16 +213,27 @@ pub(crate) fn handle(
     let semantic_millis = elapsed_millis(semantic_started);
 
     let shard_started = Instant::now();
-    let universe = if requested_full_rebuild {
-        universe(&snap)?
+    let snapshot_universe = if requested_full_rebuild {
+        observed_universe
     } else {
-        cached_universe
-            .ok_or_else(|| anyhow::format_err!("incremental graph snapshot lost its universe"))?
+        let cached = cached_universe
+            .ok_or_else(|| anyhow::format_err!("incremental graph snapshot lost its universe"))?;
+        if cached != observed_universe {
+            return Err(retry_error("graph snapshot universe moved; retry the request"));
+        }
+        cached
     };
-    let shards = build_shards(&snap, index, &universe)?;
+    let shards = build_shards(&snap, index, &snapshot_universe)?;
     let shard_millis = elapsed_millis(shard_started);
 
     let encode_started = Instant::now();
+    validate_project_model_inputs(&snap)?;
+    if universe(&snap)? != snapshot_universe {
+        snap.graph_snapshot_cache.lock().invalidate_all();
+        return Err(retry_error(
+            "graph snapshot universe moved while it was being built; retry the request",
+        ));
+    }
     let mut cache = snap.graph_snapshot_cache.lock();
     if cache.revision != revision {
         return Err(retry_error(
@@ -272,7 +291,7 @@ pub(crate) fn handle(
         .map(|key| (*key).to_owned())
         .collect::<Vec<_>>();
     let base_generation = cache.committed.as_ref().map(|cached| cached.generation.clone());
-    let generation = snapshot_generation(&universe.digest, &manifest)?;
+    let generation = snapshot_generation(&snapshot_universe.digest, &manifest)?;
     cache.sequence = cache.sequence.wrapping_add(1);
     let sequence = cache.sequence;
     let producer = producer();
@@ -287,7 +306,7 @@ pub(crate) fn handle(
     let cached = CachedSnapshot {
         revision,
         producer,
-        universe,
+        universe: snapshot_universe,
         sequence,
         generation,
         manifest,
@@ -306,9 +325,103 @@ pub(crate) fn handle(
     Ok(response.into_result())
 }
 
+fn checkpoint_response(
+    snap: &GlobalStateSnapshot,
+    snapshot_universe: &GraphSnapshotUniverse,
+    checkpoint: &GraphSnapshotCheckpoint,
+    params: &GraphSnapshotParams,
+) -> anyhow::Result<GraphSnapshotResult> {
+    if checkpoint.protocol_version != PROTOCOL_VERSION
+        || checkpoint.schema_version != SCHEMA_VERSION
+        || checkpoint.producer != producer()
+        || checkpoint.universe != snapshot_universe.digest
+        || params.known_generation.as_deref() != Some(checkpoint.generation.as_str())
+    {
+        return Err(retry_error(
+            "persisted graph checkpoint does not match this producer universe; rebuild and retry",
+        ));
+    }
+    let mut expected_sources =
+        StaticIndex::graph_source_files(&snap.analysis, VendoredLibrariesConfig::Excluded)
+            .into_iter()
+            .map(|file_id| {
+                let source = source_path(snap, file_id);
+                let text = snap.analysis.file_text(file_id)?;
+                Ok((source, digest_bytes(text.as_bytes())))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+    expected_sources.sort();
+    let mut actual_sources = checkpoint
+        .sources
+        .iter()
+        .map(|source| (source.source.clone(), source.checker_digest.clone()))
+        .collect::<Vec<_>>();
+    actual_sources.sort();
+    let actual_source_count = actual_sources.len();
+    actual_sources.dedup();
+    if actual_sources.len() != actual_source_count || actual_sources != expected_sources {
+        return Err(retry_error(
+            "persisted graph checkpoint source manifest moved; rebuild and retry",
+        ));
+    }
+    let mut manifest = checkpoint.manifest.clone();
+    manifest.sort_by(|left, right| left.key.cmp(&right.key));
+    let manifest_count = manifest.len();
+    manifest.dedup_by(|left, right| left.key == right.key);
+    if manifest.len() != manifest_count
+        || manifest.len() != expected_sources.len()
+        || !manifest.iter().all(|entry| {
+            entry.digest.len() == 64
+                && entry.digest.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                && expected_sources.iter().any(|(source, _)| {
+                    entry.key == format!("{}\0{}", snapshot_universe.target, source)
+                })
+        })
+        || snapshot_generation(&snapshot_universe.digest, &manifest)? != checkpoint.generation
+    {
+        return Err(retry_error(
+            "persisted graph checkpoint manifest is invalid; rebuild and retry",
+        ));
+    }
+    validate_project_model_inputs(snap)?;
+    if universe(snap)? != *snapshot_universe {
+        return Err(retry_error(
+            "graph snapshot universe moved while validating a checkpoint; retry",
+        ));
+    }
+    Ok(GraphSnapshotResult {
+        protocol_version: PROTOCOL_VERSION,
+        schema_version: SCHEMA_VERSION,
+        producer: producer(),
+        universe: snapshot_universe.clone(),
+        sequence: 1,
+        generation: checkpoint.generation.clone(),
+        base_generation: Some(checkpoint.generation.clone()),
+        upserts: Vec::new(),
+        deletes: Vec::new(),
+        manifest,
+        phases: GraphSnapshotPhases { cache_hit: true, ..GraphSnapshotPhases::default() },
+    })
+}
+
 fn retry_error(message: &str) -> anyhow::Error {
     crate::lsp::LspError::new(lsp_server::ErrorCode::ServerCancelled as i32, message.to_owned())
         .into()
+}
+
+fn validate_project_model_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<()> {
+    for workspace in snap.workspaces.iter() {
+        if !matches!(workspace.kind, ProjectWorkspaceKind::Cargo { .. }) {
+            continue;
+        }
+        let current = fs::read(workspace.workspace_root().join("Cargo.lock")).ok();
+        if current.as_deref() != workspace.graph_lockfile.as_deref() {
+            return Err(retry_error(
+                "Cargo.lock moved beyond the immutable project model; reload and retry",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -441,12 +554,13 @@ fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse>
             "workspace-descriptor-sha256={}",
             digest_bytes(workspace.graph_semantic_descriptor().as_bytes())
         ));
-        let lockfile = workspace.workspace_root().join("Cargo.lock");
         configurations.push(format!(
             "cargo-lock-sha256={}",
-            fs::read(&lockfile)
-                .map(|contents| digest_bytes(&contents))
-                .unwrap_or_else(|_| "missing".to_owned())
+            workspace
+                .graph_lockfile
+                .as_deref()
+                .map(digest_bytes)
+                .unwrap_or_else(|| "missing".to_owned())
         ));
         configurations.push(format!("target={:?}", workspace.target));
         configurations.extend(workspace.rustc_cfg.iter().map(|cfg| format!("cfg={cfg:?}")));
@@ -573,7 +687,13 @@ fn compute_interface_fingerprints(
         {
             let source = source_path(snap, definition.file_id);
             if let Some(source_entries) = entries.get_mut(&source) {
-                let macro_body = if token.kind == SymbolInformationKind::Macro {
+                let semantic_body = if matches!(
+                    token.kind,
+                    SymbolInformationKind::Constant
+                        | SymbolInformationKind::EnumMember
+                        | SymbolInformationKind::Macro
+                        | SymbolInformationKind::StaticVariable
+                ) {
                     token.definition_body.and_then(|body| {
                         let text = snap.analysis.file_text(body.file_id).ok()?;
                         text.get(usize::from(body.range.start())..usize::from(body.range.end()))
@@ -588,13 +708,18 @@ fn compute_interface_fingerprints(
                     "qualifiedName": token.qualified_name,
                     "signature": token.signature,
                     "exported": token.exported,
-                    "macroBody": macro_body,
+                    "semanticBody": semantic_body,
                 }))?);
             }
         }
 
         for reference in &token.references {
-            if reference.is_definition || reference.role != StaticReferenceRole::Import {
+            if reference.is_definition
+                || !matches!(
+                    reference.role,
+                    StaticReferenceRole::Export | StaticReferenceRole::Import
+                )
+            {
                 continue;
             }
             let source = source_path(snap, reference.range.file_id);
@@ -652,13 +777,17 @@ fn build_shards(
     let relations = index.relations;
     let tokens = index.tokens.iter().map(|(_, token)| token).collect::<Vec<_>>();
     let mut sources = BTreeMap::<FileId, String>::new();
+    let mut source_digests = BTreeMap::<String, String>::new();
     let conditional_files = files
         .iter()
         .filter(|file| file.conditional_build)
         .map(|file| file.file_id)
         .collect::<BTreeSet<_>>();
     for file in &files {
-        sources.insert(file.file_id, source_path(snap, file.file_id));
+        let source = source_path(snap, file.file_id);
+        let text = snap.analysis.file_text(file.file_id)?;
+        source_digests.insert(source.clone(), digest_bytes(text.as_bytes()));
+        sources.insert(file.file_id, source);
     }
 
     let mut shards = sources
@@ -765,10 +894,14 @@ fn build_shards(
             let Some(source) = sources.get(&reference.range.file_id) else {
                 continue;
             };
-            let owner = enclosing_owner(&definitions, reference.range)
-                .map(str::to_owned)
-                .or_else(|| file_nodes.get(&reference.range.file_id).cloned())
-                .unwrap();
+            let owner = if reference.role == StaticReferenceRole::Export {
+                file_nodes.get(&reference.range.file_id).cloned().unwrap()
+            } else {
+                enclosing_owner(&definitions, reference.range)
+                    .map(str::to_owned)
+                    .or_else(|| file_nodes.get(&reference.range.file_id).cloned())
+                    .unwrap()
+            };
             let kind = reference_kind(reference.role);
             let key = (owner.clone(), token.stable_id.clone(), kind.to_owned(), source.clone());
             if edge_keys.insert(key) {
@@ -878,6 +1011,21 @@ fn build_shards(
                 }),
             );
         }
+        let range = snap.analysis.parse(file_id)?.syntax().text_range();
+        let position = evidence(snap, FileRange { file_id, range })?;
+        let shard = shards.get_mut(source).unwrap();
+        for (family, state) in COVERAGE {
+            if state == "partial"
+                && !shard.unresolved.iter().any(|unresolved| unresolved.family == family)
+            {
+                shard.unresolved.push(GraphSnapshotUnresolved {
+                    family: family.to_owned(),
+                    evidence: position.clone(),
+                    reason: "provider-gap".to_owned(),
+                    candidates: Vec::new(),
+                });
+            }
+        }
     }
 
     let test_attributes = tokens
@@ -951,9 +1099,14 @@ fn build_shards(
             })
             .collect::<Vec<_>>();
         let key = format!("{}\0{}", universe.target, shard.source);
+        let checker_digest = source_digests
+            .get(&shard.source)
+            .cloned()
+            .ok_or_else(|| anyhow::format_err!("graph shard lost its checker source digest"))?;
         let digest = shard_digest(
             &key,
             &shard.source,
+            &checker_digest,
             &shard.nodes,
             &shard.edges,
             &shard.diagnostics,
@@ -963,6 +1116,7 @@ fn build_shards(
         result.push(GraphSnapshotShard {
             key,
             source: shard.source,
+            checker_digest,
             digest,
             nodes: shard.nodes,
             edges: shard.edges,
@@ -1009,6 +1163,7 @@ fn reference_kind(role: StaticReferenceRole) -> &'static str {
         StaticReferenceRole::Access => "accesses",
         StaticReferenceRole::Call => "calls",
         StaticReferenceRole::Decorate => "decorates",
+        StaticReferenceRole::Export => "exports",
         StaticReferenceRole::Import => "imports",
         StaticReferenceRole::Instantiate => "instantiates",
         StaticReferenceRole::Reference => "references",
@@ -1061,7 +1216,7 @@ fn collect_unresolved(
     );
 
     let mut unresolved = Vec::new();
-    for token in tokens.iter().filter(|token| token.kind == SymbolInformationKind::TraitMethod) {
+    for token in tokens.iter().filter(|token| token.trait_member) {
         for reference in token.references.iter().filter(|reference| {
             !reference.is_definition
                 && reference.range.file_id == file_id
@@ -1150,6 +1305,7 @@ fn evidence(snap: &GlobalStateSnapshot, range: FileRange) -> anyhow::Result<Grap
 fn shard_digest(
     key: &str,
     source: &str,
+    checker_digest: &str,
     nodes: &[GraphSnapshotNode],
     edges: &[GraphSnapshotEdge],
     diagnostics: &[GraphSnapshotDiagnostic],
@@ -1159,6 +1315,7 @@ fn shard_digest(
     digest_json(&json!({
         "key": key,
         "source": source,
+        "checkerDigest": checker_digest,
         "nodes": nodes,
         "edges": edges,
         "diagnostics": diagnostics,
@@ -1243,7 +1400,7 @@ mod tests {
 
     use super::{
         CachedSnapshot, GraphSnapshotCache, digest_json, interfaces_changed, response_for,
-        write_canonical_json,
+        shard_digest, write_canonical_json,
     };
 
     #[test]
@@ -1259,10 +1416,23 @@ mod tests {
     }
 
     #[test]
+    fn shard_identity_includes_the_exact_checker_source_digest() {
+        let left =
+            shard_digest("target\0src/lib.rs", "src/lib.rs", "left", &[], &[], &[], &[], &[])
+                .unwrap();
+        let right =
+            shard_digest("target\0src/lib.rs", "src/lib.rs", "right", &[], &[], &[], &[], &[])
+                .unwrap();
+
+        assert_ne!(left, right);
+    }
+
+    #[test]
     fn cached_snapshot_selects_noop_delta_full_and_incremental_responses() {
         let shard = GraphSnapshotShard {
             key: "target\0src/lib.rs".to_owned(),
             source: "src/lib.rs".to_owned(),
+            checker_digest: "checker".to_owned(),
             digest: "digest".to_owned(),
             nodes: Vec::new(),
             edges: Vec::new(),

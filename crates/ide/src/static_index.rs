@@ -18,7 +18,10 @@ use ide_db::{
     ra_fixture::RaFixtureConfig,
 };
 use sha2::{Digest as _, Sha256};
-use syntax::{AstNode, AstToken, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, ast};
+use syntax::{
+    AstNode, AstToken, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange,
+    ast::{self, HasVisibility},
+};
 
 use crate::navigation_target::{NavigationTarget, UpmappingResult};
 use crate::{
@@ -69,6 +72,7 @@ pub enum StaticReferenceRole {
     Access,
     Call,
     Decorate,
+    Export,
     Import,
     Instantiate,
     Reference,
@@ -87,6 +91,8 @@ pub struct TokenStaticData {
     pub exported: bool,
     pub external: bool,
     pub local: bool,
+    /// Whether this definition is an associated item declared by a trait.
+    pub trait_member: bool,
     // FIXME: Make this have the lifetime of the database.
     pub documentation: Option<Documentation<'static>>,
     pub hover: Option<HoverResult>,
@@ -235,7 +241,13 @@ fn reference_role(
     while let Some(current) = node {
         match current.kind() {
             SyntaxKind::ATTR => return StaticReferenceRole::Decorate,
-            SyntaxKind::USE_TREE => return StaticReferenceRole::Import,
+            SyntaxKind::USE_TREE => {
+                return if public_use(token) && is_terminal_path_segment(token) {
+                    StaticReferenceRole::Export
+                } else {
+                    StaticReferenceRole::Import
+                };
+            }
             SyntaxKind::PATH_TYPE if is_terminal_path_segment(token) => {
                 return StaticReferenceRole::Type;
             }
@@ -298,6 +310,14 @@ fn reference_role(
     StaticReferenceRole::Reference
 }
 
+fn public_use(token: &SyntaxToken) -> bool {
+    token
+        .parent_ancestors()
+        .find_map(ast::Use::cast)
+        .and_then(|use_| use_.visibility())
+        .is_some_and(|visibility| visibility.syntax().text() == "pub")
+}
+
 fn is_terminal_path_segment(token: &SyntaxToken) -> bool {
     let Some(segment) = token.parent_ancestors().find_map(ast::PathSegment::cast) else {
         return true;
@@ -357,6 +377,15 @@ fn stable_definition_id(
         }
         None => {
             append_component(&mut id, "scope", "builtin-or-unresolved");
+            if let Some(owner) = semantic_owner(db, def)
+                && let Some(krate) = owner.krate(db)
+            {
+                append_component(
+                    &mut id,
+                    "enclosing-owner",
+                    &stable_id_for_definition(db, sema, krate, owner),
+                );
+            }
             append_local_identity(&mut id, db, sema, def, nav);
         }
     }
@@ -404,10 +433,17 @@ fn append_assoc_identity(
 }
 
 fn crate_context_digest(db: &RootDatabase, def: Definition<'_>) -> String {
-    let Some(krate) = def.krate(db) else {
+    let Some(krate) = def.krate(db).or_else(|| semantic_owner(db, def)?.krate(db)) else {
         return "builtin".to_owned();
     };
     crate_context_digest_for_crate(db, krate)
+}
+
+fn semantic_owner<'db>(db: &'db RootDatabase, def: Definition<'db>) -> Option<Definition<'db>> {
+    match def {
+        Definition::TupleField(field) => field.parent(db).try_into().ok(),
+        _ => def.enclosing_definition(db),
+    }
 }
 
 fn crate_context_digest_for_crate(db: &RootDatabase, krate: Crate) -> String {
@@ -453,6 +489,23 @@ fn crate_root_key(db: &RootDatabase, krate: Crate, local: bool) -> String {
     let Some(path) = root_path.as_path() else {
         return root_path.to_string();
     };
+    let local_roots = Crate::all(db)
+        .into_iter()
+        .filter(|candidate| candidate.origin(db).is_local())
+        .filter_map(|candidate| {
+            let root_file = candidate.root_file(db);
+            let source_root = db.file_source_root(root_file).source_root_id(db);
+            db.source_root(source_root)
+                .source_root(db)
+                .path_for_file(&root_file)
+                .and_then(|root| root.as_path())
+                .map(|root| normalize_identity_path(root.as_str()))
+        })
+        .collect::<Vec<_>>();
+    if local_roots.len() > 1 {
+        let current = normalize_identity_path(path.as_str());
+        return relative_to_common_root(&current, &local_roots);
+    }
     let cwd = &krate.base().data(db).proc_macro_cwd;
     if let Some(relative) = path.strip_prefix(cwd.as_path()) {
         return relative.as_str().replace('\\', "/");
@@ -465,6 +518,43 @@ fn crate_root_key(db: &RootDatabase, krate: Crate, local: bool) -> String {
         .collect::<Vec<_>>();
     suffix.reverse();
     suffix.join("/")
+}
+
+fn relative_to_common_root(current: &str, paths: &[String]) -> String {
+    let prefix = common_path_prefix(paths);
+    current.strip_prefix(&prefix).unwrap_or(current).trim_start_matches('/').to_owned()
+}
+
+fn normalize_identity_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn common_path_prefix(paths: &[String]) -> String {
+    let Some(first) = paths.first() else {
+        return String::new();
+    };
+    let mut components = first.split('/').collect::<Vec<_>>();
+    for path in &paths[1..] {
+        let candidate = path.split('/').collect::<Vec<_>>();
+        let shared =
+            components.iter().zip(candidate).take_while(|(left, right)| *left == right).count();
+        components.truncate(shared);
+    }
+    if components.is_empty() { String::new() } else { format!("{}/", components.join("/")) }
+}
+
+fn is_effectively_exported(db: &RootDatabase, def: Definition<'_>) -> bool {
+    if !matches!(def.visibility(db), Some(hir::Visibility::Public)) {
+        return false;
+    }
+    let mut owner = def.enclosing_definition(db);
+    while let Some(current) = owner {
+        if current.visibility(db).is_some_and(|visibility| visibility != hir::Visibility::Public) {
+            return false;
+        }
+        owner = current.enclosing_definition(db);
+    }
+    true
 }
 
 fn append_moniker(id: &mut String, moniker: &crate::Moniker) {
@@ -507,8 +597,7 @@ fn append_local_identity(
     if let Some(name) = node.clone().and_then(|node| node.ancestors().find_map(ast::Name::cast)) {
         let name_text = name.syntax().text().to_string();
         let parent_kind = name.syntax().parent().map(|parent| parent.kind());
-        let scope = def
-            .enclosing_definition(db)
+        let scope = semantic_owner(db, def)
             .and_then(|owner| owner.try_to_nav(sema))
             .map(UpmappingResult::call_site)
             .filter(|owner| owner.file_id == nav.file_id)
@@ -532,8 +621,7 @@ fn append_local_identity(
         return;
     }
 
-    let scope = def
-        .enclosing_definition(db)
+    let scope = semantic_owner(db, def)
         .and_then(|owner| owner.try_to_nav(sema))
         .map(UpmappingResult::call_site)
         .filter(|owner| owner.file_id == nav.file_id)
@@ -677,6 +765,7 @@ fn assoc_item_definition<'db>(item: AssocItem) -> Definition<'db> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum VendoredLibrariesConfig<'a> {
     Included { workspace_root: &'a VfsPath },
     Excluded,
@@ -685,12 +774,16 @@ pub enum VendoredLibrariesConfig<'a> {
 impl<'a> StaticIndex<'a> {
     fn add_file(&mut self, file_id: FileId) {
         let graph = self.graph;
-        let crates = crates_for(self.db, file_id);
+        let mut crates = crates_for(self.db, file_id);
         let conditional_build = graph && crates.len() > 1;
-        let current_crate = crates
-            .into_iter()
-            .map(Into::into)
-            .min_by_key(|krate| crate_context_digest_for_crate(self.db, *krate));
+        let current_crate = if graph {
+            crates
+                .into_iter()
+                .map(Into::into)
+                .min_by_key(|krate| crate_context_digest_for_crate(self.db, *krate))
+        } else {
+            crates.pop().map(Into::into)
+        };
         let folds = self.analysis.folding_ranges(file_id, true).unwrap();
         // hovers
         let sema = hir::Semantics::new(self.db);
@@ -738,8 +831,7 @@ impl<'a> StaticIndex<'a> {
                     qualified_name: graph
                         .then(|| qualified_name(moniker.as_ref(), def, self.db, edition))
                         .flatten(),
-                    exported: graph
-                        && matches!(def.visibility(self.db), Some(hir::Visibility::Public)),
+                    exported: graph && is_effectively_exported(self.db, def),
                     external: graph
                         && nav.as_ref().is_some_and(|nav| {
                             let source_root =
@@ -747,6 +839,10 @@ impl<'a> StaticIndex<'a> {
                             self.db.source_root(source_root).source_root(self.db).is_library
                         }),
                     local: graph && local,
+                    trait_member: graph
+                        && def.as_assoc_item(self.db).is_some_and(|item| {
+                            matches!(item.container(self.db), AssocItemContainer::Trait(_))
+                        }),
                     documentation: documentation_for_definition(&sema, def, scope_node),
                     hover: Some(hover_for_definition(
                         &sema,
@@ -899,6 +995,36 @@ impl<'a> StaticIndex<'a> {
             }
             this.relations = semantic_relations(db, Some(&visited_files));
             this
+        })
+    }
+
+    /// Source files owned by the same graph traversal, without indexing their
+    /// declarations or references. Used to validate persisted checkpoints.
+    pub fn graph_source_files(
+        analysis: &'a Analysis,
+        vendored_libs_config: VendoredLibrariesConfig<'_>,
+    ) -> Vec<FileId> {
+        let db = &analysis.db;
+        hir::attach_db(db, || {
+            let mut files = all_modules(db)
+                .into_iter()
+                .filter_map(|module| {
+                    let file_id = module.definition_source_file_id(db).original_file(db);
+                    let file_id = file_id.file_id(db);
+                    let source_root = db.file_source_root(file_id).source_root_id(db);
+                    let source_root = db.source_root(source_root).source_root(db);
+                    let is_vendored = match vendored_libs_config {
+                        VendoredLibrariesConfig::Included { workspace_root } => source_root
+                            .path_for_file(&file_id)
+                            .is_some_and(|module_path| module_path.starts_with(workspace_root)),
+                        VendoredLibrariesConfig::Excluded => false,
+                    };
+                    (!source_root.is_library || is_vendored).then_some(file_id)
+                })
+                .collect::<Vec<_>>();
+            files.sort_by_key(|file_id| file_id.index());
+            files.dedup();
+            files
         })
     }
 }
@@ -1318,6 +1444,87 @@ pub fn execute() {}
 
         assert_eq!(ids.len(), 2, "{ids:#?}");
         assert!(ids.iter().all(|id| id.contains("crate-context")));
+    }
+
+    #[test]
+    fn graph_identity_separates_identical_linked_workspace_roots() {
+        let roots =
+            vec!["/workspace/one/src/lib.rs".to_owned(), "/workspace/two/src/lib.rs".to_owned()];
+
+        assert_eq!(
+            super::relative_to_common_root("/workspace/one/src/lib.rs", &roots),
+            "one/src/lib.rs"
+        );
+        assert_eq!(
+            super::relative_to_common_root("/workspace/two/src/lib.rs", &roots),
+            "two/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn graph_identity_namespaces_tuple_fields_by_their_owner() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- /workspace/lib.rs crate:main
+pub fn first(value: (u8,)) -> u8 { value.0 }
+pub fn second(value: (u8,)) -> u8 { value.0 }
+"#,
+        );
+        let ids = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded)
+            .tokens
+            .iter()
+            .filter(|(_, token)| {
+                token.display_name.as_deref() == Some("0")
+                    && token.kind == super::SymbolInformationKind::Field
+            })
+            .map(|(_, token)| token.stable_id.clone())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(ids.len(), 2, "{ids:#?}");
+        assert!(ids.iter().all(|id| id.contains("enclosing-owner")), "{ids:#?}");
+    }
+
+    #[test]
+    fn graph_exports_follow_effective_visibility_and_public_uses() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- /workspace/lib.rs crate:main
+mod private { pub fn hidden() {} }
+pub fn exposed() {}
+pub use private::hidden as alias;
+"#,
+        );
+        let index = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded);
+        let tokens = index.tokens.iter().map(|(_, token)| token).collect::<Vec<_>>();
+        let hidden = tokens.iter().find(|token| token.display_name.as_deref() == Some("hidden"));
+        let exposed = tokens.iter().find(|token| token.display_name.as_deref() == Some("exposed"));
+
+        assert!(!hidden.unwrap().exported);
+        assert!(exposed.unwrap().exported);
+        assert!(hidden.unwrap().references.iter().any(|reference| {
+            !reference.is_definition && reference.role == super::StaticReferenceRole::Export
+        }));
+    }
+
+    #[test]
+    fn graph_marks_default_trait_methods_as_trait_members() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- /workspace/lib.rs crate:main
+pub trait Render { fn render(&self) {} }
+pub fn call(value: &dyn Render) { value.render(); }
+"#,
+        );
+        let tokens = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded)
+            .tokens
+            .iter()
+            .map(|(_, token)| token)
+            .collect::<Vec<_>>();
+        let render = tokens.iter().find(|token| {
+            token.definition.is_some() && token.display_name.as_deref() == Some("render")
+        });
+
+        assert!(render.unwrap().trait_member);
     }
 
     #[test]

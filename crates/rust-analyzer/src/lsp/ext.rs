@@ -74,6 +74,27 @@ impl Request for GraphSnapshotRequest {
 #[serde(rename_all = "camelCase")]
 pub struct GraphSnapshotParams {
     pub known_generation: Option<String>,
+    /// Persisted consumer checkpoint to validate after a server restart.
+    pub checkpoint: Option<GraphSnapshotCheckpoint>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotCheckpoint {
+    pub protocol_version: u32,
+    pub schema_version: u32,
+    pub producer: GraphSnapshotProducer,
+    pub universe: String,
+    pub generation: String,
+    pub manifest: Vec<GraphSnapshotManifestEntry>,
+    pub sources: Vec<GraphSnapshotCheckpointSource>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotCheckpointSource {
+    pub source: String,
+    pub checker_digest: String,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
@@ -122,6 +143,8 @@ pub struct GraphSnapshotManifestEntry {
 pub struct GraphSnapshotShard {
     pub key: String,
     pub source: String,
+    /// SHA-256 of the exact immutable Analysis text used for this shard.
+    pub checker_digest: String,
     pub digest: String,
     pub nodes: Vec<GraphSnapshotNode>,
     pub edges: Vec<GraphSnapshotEdge>,

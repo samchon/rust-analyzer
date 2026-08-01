@@ -42,6 +42,7 @@ fn load_workspace_from_metadata(file: &str) -> ProjectWorkspace {
             rustc: Err(None),
             error: None,
         },
+        graph_lockfile: None,
         cfg_overrides: Default::default(),
         sysroot: Sysroot::empty(),
         rustc_cfg: Vec::new(),
@@ -58,6 +59,7 @@ fn load_rust_project(file: &str) -> (CrateGraphBuilder, ProcMacroPaths) {
     let sysroot = Sysroot::empty();
     let project_workspace = ProjectWorkspace {
         kind: ProjectWorkspaceKind::Json(project),
+        graph_lockfile: None,
         sysroot,
         rustc_cfg: Vec::new(),
         toolchain: None,
@@ -270,6 +272,7 @@ fn smoke_test_real_sysroot_cargo() {
             rustc: Err(None),
             error: None,
         },
+        graph_lockfile: None,
         sysroot,
         rustc_cfg: Vec::new(),
         cfg_overrides: Default::default(),

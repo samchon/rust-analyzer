@@ -1388,6 +1388,11 @@ impl<'db> TupleField<'db> {
             .unwrap_or_else(|| Ty::new_error(interner, ErrorGuaranteed));
         Type::new_body(db, self.owner.expression_store_owner(db), ty)
     }
+
+    /// Semantic owner whose inference produced this tuple-field identity.
+    pub fn parent(&self, db: &'db dyn HirDatabase) -> ExpressionStoreOwner {
+        self.owner.expression_store_owner(db).into()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
