@@ -61,6 +61,145 @@ pub struct AnalyzerStatusParams {
     pub text_document: Option<TextDocumentIdentifier>,
 }
 
+pub enum GraphSnapshotRequest {}
+
+impl Request for GraphSnapshotRequest {
+    type Params = GraphSnapshotParams;
+    type Result = GraphSnapshotResult;
+    const METHOD: LspRequestMethod<'_> = LspRequestMethod::new("samchon/graphSnapshot");
+    const MESSAGE_DIRECTION: MessageDirection = MessageDirection::ClientToServer;
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotParams {
+    pub known_generation: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotResult {
+    pub protocol_version: u32,
+    pub schema_version: u32,
+    pub producer: GraphSnapshotProducer,
+    pub universe: GraphSnapshotUniverse,
+    pub sequence: u64,
+    pub generation: String,
+    pub base_generation: Option<String>,
+    pub upserts: Vec<GraphSnapshotShard>,
+    pub deletes: Vec<String>,
+    pub manifest: Vec<GraphSnapshotManifestEntry>,
+    pub phases: GraphSnapshotPhases,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotProducer {
+    pub name: String,
+    pub version: String,
+    pub commit: String,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotUniverse {
+    pub digest: String,
+    pub target: String,
+    pub workspace_roots: Vec<String>,
+    pub toolchains: Vec<String>,
+    pub configurations: Vec<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotManifestEntry {
+    pub key: String,
+    pub digest: String,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotShard {
+    pub key: String,
+    pub source: String,
+    pub digest: String,
+    pub nodes: Vec<GraphSnapshotNode>,
+    pub edges: Vec<GraphSnapshotEdge>,
+    pub diagnostics: Vec<GraphSnapshotDiagnostic>,
+    pub coverage: Vec<GraphSnapshotCoverage>,
+    pub unresolved: Vec<GraphSnapshotUnresolved>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotNode {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub qualified_name: Option<String>,
+    pub file: String,
+    pub external: bool,
+    pub exported: bool,
+    pub signature: Option<String>,
+    pub evidence: Option<GraphSnapshotEvidence>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotEdge {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+    pub evidence: Option<GraphSnapshotEvidence>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotDiagnostic {
+    pub file: String,
+    pub line: u32,
+    pub column: Option<u32>,
+    pub code: String,
+    pub message: String,
+    pub severity: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotCoverage {
+    pub family: String,
+    pub state: String,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotUnresolved {
+    pub family: String,
+    pub evidence: GraphSnapshotEvidence,
+    pub reason: String,
+    pub candidates: Vec<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotEvidence {
+    pub file: String,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSnapshotPhases {
+    pub semantic_millis: u64,
+    pub shard_millis: u64,
+    pub encode_millis: u64,
+    pub total_millis: u64,
+    pub cache_hit: bool,
+}
+
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct CrateInfoResult {

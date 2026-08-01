@@ -1,9 +1,11 @@
 //! This module provides `StaticIndex` which is used for powering
 //! read-only code browsers and emitting LSIF
 
+use std::{collections::BTreeSet, fmt::Write as _};
+
 use arrayvec::ArrayVec;
 use either::Either;
-use hir::{Crate, Module, Semantics, db::HirDatabase};
+use hir::{AssocItem, Crate, Impl, Module, Semantics, db::HirDatabase};
 use ide_db::{
     FileId, FileRange, FxHashMap, FxHashSet, RootDatabase,
     base_db::{SourceDatabase, VfsPath},
@@ -14,7 +16,7 @@ use ide_db::{
 };
 use syntax::{AstNode, AstToken, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, ast};
 
-use crate::navigation_target::UpmappingResult;
+use crate::navigation_target::{NavigationTarget, UpmappingResult};
 use crate::{
     Analysis, Fold, HoverConfig, HoverResult, TryToNav,
     hover::{SubstTyLen, hover_for_definition},
@@ -29,19 +31,58 @@ use crate::{
 pub struct StaticIndex<'a> {
     pub files: Vec<StaticIndexedFile>,
     pub tokens: TokenStore,
+    pub relations: Vec<StaticRelation>,
     analysis: &'a Analysis,
     db: &'a RootDatabase,
     def_map: FxHashMap<Definition<'a>, TokenId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StaticRelation {
+    pub file_id: FileId,
+    pub from: String,
+    pub to: String,
+    pub kind: StaticRelationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StaticRelationKind {
+    Extends,
+    Implements,
+    Overrides,
+    Dispatches,
 }
 
 #[derive(Debug)]
 pub struct ReferenceData {
     pub range: FileRange,
     pub is_definition: bool,
+    pub role: StaticReferenceRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticReferenceRole {
+    Access,
+    Call,
+    Decorate,
+    Import,
+    Instantiate,
+    Reference,
+    Type,
 }
 
 #[derive(Debug)]
 pub struct TokenStaticData {
+    /// Versioned semantic identity used by graph-style whole-project exports.
+    ///
+    /// Non-local definitions are keyed by rust-analyzer's HIR-derived moniker.
+    /// Locals add a syntax-structural path beneath their enclosing semantic
+    /// definition. Declaration coordinates are deliberately excluded.
+    pub stable_id: String,
+    pub qualified_name: Option<String>,
+    pub exported: bool,
+    pub external: bool,
+    pub local: bool,
     // FIXME: Make this have the lifetime of the database.
     pub documentation: Option<Documentation<'static>>,
     pub hover: Option<HoverResult>,
@@ -107,6 +148,10 @@ impl TokenStore {
     pub fn iter(self) -> impl Iterator<Item = (TokenId, TokenStaticData)> {
         self.0.into_iter().enumerate().map(|(id, data)| (TokenId(id), data))
     }
+
+    pub fn iter_ref(&self) -> impl Iterator<Item = (TokenId, &TokenStaticData)> {
+        self.0.iter().enumerate().map(|(id, data)| (TokenId(id), data))
+    }
 }
 
 #[derive(Debug)]
@@ -147,16 +192,365 @@ fn documentation_for_definition(
 fn get_definitions<'db>(
     sema: &Semantics<'db, RootDatabase>,
     token: SyntaxToken,
-) -> Option<ArrayVec<(Definition<'db>, Option<hir::GenericSubstitution<'db>>), 2>> {
+) -> Option<
+    ArrayVec<(Definition<'db>, Option<hir::GenericSubstitution<'db>>, StaticReferenceRole), 2>,
+> {
     for token in sema.descend_into_macros_exact(token) {
         let def = IdentClass::classify_token(sema, &token).map(IdentClass::definitions);
         if let Some(defs) = def
             && !defs.is_empty()
         {
-            return Some(defs);
+            return Some(
+                defs.into_iter()
+                    .map(|(def, substitution)| {
+                        (def, substitution, reference_role(sema.db, def, &token))
+                    })
+                    .collect(),
+            );
         }
     }
     None
+}
+
+fn reference_role(
+    db: &RootDatabase,
+    def: Definition<'_>,
+    token: &SyntaxToken,
+) -> StaticReferenceRole {
+    let range = token.text_range();
+    let target_kind = def_to_kind(db, def);
+    let mut node = token.parent();
+    while let Some(current) = node {
+        match current.kind() {
+            SyntaxKind::ATTR => return StaticReferenceRole::Decorate,
+            SyntaxKind::USE_TREE => return StaticReferenceRole::Import,
+            SyntaxKind::PATH_TYPE => return StaticReferenceRole::Type,
+            SyntaxKind::MACRO_CALL if target_kind == SymbolInformationKind::Macro => {
+                return StaticReferenceRole::Call;
+            }
+            SyntaxKind::PATH_EXPR
+                if matches!(
+                    target_kind,
+                    SymbolInformationKind::Struct | SymbolInformationKind::EnumMember
+                ) && current.text_range().end() == range.end() =>
+            {
+                return StaticReferenceRole::Instantiate;
+            }
+            SyntaxKind::RECORD_EXPR
+                if ast::RecordExpr::cast(current.clone())
+                    .and_then(|expr| expr.path())
+                    .is_some_and(|path| path.syntax().text_range().contains_range(range)) =>
+            {
+                return StaticReferenceRole::Instantiate;
+            }
+            SyntaxKind::CALL_EXPR
+                if ast::CallExpr::cast(current.clone())
+                    .and_then(|expr| expr.expr())
+                    .is_some_and(|callee| callee.syntax().text_range().contains_range(range)) =>
+            {
+                return StaticReferenceRole::Call;
+            }
+            SyntaxKind::METHOD_CALL_EXPR => {
+                let Some(expr) = ast::MethodCallExpr::cast(current.clone()) else {
+                    node = current.parent();
+                    continue;
+                };
+                if expr
+                    .name_ref()
+                    .is_some_and(|name| name.syntax().text_range().contains_range(range))
+                {
+                    return StaticReferenceRole::Call;
+                }
+                if matches!(
+                    target_kind,
+                    SymbolInformationKind::Struct | SymbolInformationKind::EnumMember
+                ) && expr
+                    .receiver()
+                    .is_some_and(|receiver| receiver.syntax().text_range().contains_range(range))
+                {
+                    return StaticReferenceRole::Instantiate;
+                }
+            }
+            SyntaxKind::FIELD_EXPR | SyntaxKind::RECORD_EXPR_FIELD => {
+                return StaticReferenceRole::Access;
+            }
+            _ => {}
+        }
+        node = current.parent();
+    }
+    StaticReferenceRole::Reference
+}
+
+fn qualified_name(
+    moniker: Option<&MonikerResult>,
+    def: Definition<'_>,
+    db: &RootDatabase,
+    edition: crate::Edition,
+) -> Option<String> {
+    let (mut parts, local) = match moniker {
+        Some(MonikerResult::Moniker(moniker)) => (
+            moniker.identifier.description.iter().map(|part| part.name.clone()).collect::<Vec<_>>(),
+            false,
+        ),
+        Some(MonikerResult::Local { enclosing_moniker }) => (
+            enclosing_moniker
+                .iter()
+                .flat_map(|moniker| &moniker.identifier.description)
+                .map(|part| part.name.clone())
+                .collect::<Vec<_>>(),
+            true,
+        ),
+        None => (Vec::new(), true),
+    };
+    if local {
+        parts.push(def.name(db)?.display(db, edition).to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join("::"))
+}
+
+fn stable_definition_id(
+    db: &RootDatabase,
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition<'_>,
+    nav: Option<&NavigationTarget>,
+    moniker: Option<&MonikerResult>,
+) -> String {
+    let mut id = String::from("rust-hir-v1");
+    match moniker {
+        Some(MonikerResult::Moniker(moniker)) => append_moniker(&mut id, moniker),
+        Some(MonikerResult::Local { enclosing_moniker }) => {
+            if let Some(moniker) = enclosing_moniker {
+                append_moniker(&mut id, moniker);
+            } else {
+                append_component(&mut id, "scope", "unresolved");
+            }
+            append_local_identity(&mut id, db, sema, def, nav);
+        }
+        None => {
+            append_component(&mut id, "scope", "builtin-or-unresolved");
+            append_local_identity(&mut id, db, sema, def, nav);
+        }
+    }
+    id
+}
+
+fn append_moniker(id: &mut String, moniker: &crate::Moniker) {
+    append_component(id, "package", &moniker.package_information.name);
+    append_component(id, "version", moniker.package_information.version.as_deref().unwrap_or(""));
+    append_component(id, "repository", moniker.package_information.repo.as_deref().unwrap_or(""));
+    append_component(id, "crate", &moniker.identifier.crate_name);
+    for descriptor in &moniker.identifier.description {
+        append_component(id, "kind", &format!("{:?}", descriptor.desc));
+        append_component(id, "name", &descriptor.name);
+    }
+}
+
+fn append_local_identity(
+    id: &mut String,
+    db: &RootDatabase,
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition<'_>,
+    nav: Option<&NavigationTarget>,
+) {
+    append_component(id, "local-kind", &format!("{:?}", def_to_kind(db, def)));
+    append_component(
+        id,
+        "local-name",
+        &def.name(db)
+            .map(|name| name.display_no_db(crate::Edition::CURRENT).to_string())
+            .unwrap_or_default(),
+    );
+
+    let Some(nav) = nav else {
+        append_component(id, "syntax", "unavailable");
+        return;
+    };
+    let root = sema.parse_guess_edition(nav.file_id).syntax().clone();
+    let range = nav.focus_or_full_range();
+    let mut node = match root.covering_element(range) {
+        NodeOrToken::Node(node) => Some(node),
+        NodeOrToken::Token(token) => token.parent(),
+    };
+    if let Some(name) = node.clone().and_then(|node| node.ancestors().find_map(ast::Name::cast)) {
+        let name_text = name.syntax().text().to_string();
+        let parent_kind = name.syntax().parent().map(|parent| parent.kind());
+        let scope = def
+            .enclosing_definition(db)
+            .and_then(|owner| owner.try_to_nav(sema))
+            .map(UpmappingResult::call_site)
+            .filter(|owner| owner.file_id == nav.file_id)
+            .map(|owner| owner.full_range)
+            .unwrap_or_else(|| root.text_range());
+        let ordinal = root
+            .descendants()
+            .filter_map(ast::Name::cast)
+            .filter(|candidate| scope.contains_range(candidate.syntax().text_range()))
+            .filter(|candidate| candidate.syntax().text().to_string() == name_text)
+            .filter(|candidate| {
+                candidate.syntax().parent().map(|parent| parent.kind()) == parent_kind
+            })
+            .take_while(|candidate| candidate.syntax().text_range() != name.syntax().text_range())
+            .count();
+        append_component(
+            id,
+            "syntax",
+            &format!("{:?}:{ordinal}", parent_kind.unwrap_or(SyntaxKind::NAME)),
+        );
+        return;
+    }
+
+    let scope = def
+        .enclosing_definition(db)
+        .and_then(|owner| owner.try_to_nav(sema))
+        .map(UpmappingResult::call_site)
+        .filter(|owner| owner.file_id == nav.file_id)
+        .map(|owner| owner.full_range)
+        .unwrap_or_else(|| root.text_range());
+    let mut path = Vec::new();
+    while let Some(current) = node {
+        if current == root || current.text_range() == scope {
+            break;
+        }
+        let kind = current.kind();
+        let ordinal = std::iter::successors(current.prev_sibling(), SyntaxNode::prev_sibling)
+            .filter(|sibling| sibling.kind() == kind)
+            .count();
+        path.push(format!("{kind:?}:{ordinal}"));
+        node = current.parent();
+    }
+    path.reverse();
+    append_component(id, "syntax", &path.join("/"));
+}
+
+fn append_component(id: &mut String, label: &str, value: &str) {
+    write!(id, "|{}:{}={}:{}", label.len(), label, value.len(), value).unwrap();
+}
+
+fn semantic_relations(db: &RootDatabase, files: Option<&FxHashSet<FileId>>) -> Vec<StaticRelation> {
+    let sema = Semantics::new(db);
+    let mut relations = BTreeSet::new();
+    for module in all_modules(db) {
+        let file_id = module.definition_source_file_id(db).original_file(db).file_id(db);
+        if files.is_some_and(|files| !files.contains(&file_id)) {
+            continue;
+        }
+        let source_root = db.file_source_root(file_id).source_root_id(db);
+        if db.source_root(source_root).source_root(db).is_library {
+            continue;
+        }
+        let krate = module.krate(db);
+        for trait_ in
+            module.declarations(db).into_iter().filter_map(|declaration| match declaration {
+                hir::ModuleDef::Trait(trait_) => Some(trait_),
+                _ => None,
+            })
+        {
+            for supertrait in trait_.direct_supertraits(db) {
+                relations.insert(relation(
+                    db,
+                    &sema,
+                    krate,
+                    file_id,
+                    trait_.into(),
+                    supertrait.into(),
+                    StaticRelationKind::Extends,
+                ));
+            }
+        }
+        for impl_ in Impl::all_in_module(db, module) {
+            let Some(trait_) = impl_.trait_(db) else {
+                continue;
+            };
+            if let Some(adt) = impl_.self_ty(db).as_adt() {
+                relations.insert(relation(
+                    db,
+                    &sema,
+                    krate,
+                    file_id,
+                    adt.into(),
+                    trait_.into(),
+                    StaticRelationKind::Implements,
+                ));
+            }
+            for item in impl_.items(db) {
+                let Some(name) = item.name(db) else {
+                    continue;
+                };
+                let Some(trait_item) = trait_.items(db).into_iter().find(|candidate| {
+                    same_assoc_item_kind(item, *candidate)
+                        && candidate.name(db).as_ref() == Some(&name)
+                }) else {
+                    continue;
+                };
+                let implementation = assoc_item_definition(item);
+                let declaration = assoc_item_definition(trait_item);
+                relations.insert(relation(
+                    db,
+                    &sema,
+                    krate,
+                    file_id,
+                    implementation,
+                    declaration,
+                    StaticRelationKind::Overrides,
+                ));
+                relations.insert(relation(
+                    db,
+                    &sema,
+                    krate,
+                    file_id,
+                    declaration,
+                    implementation,
+                    StaticRelationKind::Dispatches,
+                ));
+            }
+        }
+    }
+    relations.into_iter().collect()
+}
+
+fn relation(
+    db: &RootDatabase,
+    sema: &Semantics<'_, RootDatabase>,
+    from_crate: Crate,
+    file_id: FileId,
+    from: Definition<'_>,
+    to: Definition<'_>,
+    kind: StaticRelationKind,
+) -> StaticRelation {
+    StaticRelation {
+        file_id,
+        from: stable_id_for_definition(db, sema, from_crate, from),
+        to: stable_id_for_definition(db, sema, from_crate, to),
+        kind,
+    }
+}
+
+fn stable_id_for_definition(
+    db: &RootDatabase,
+    sema: &Semantics<'_, RootDatabase>,
+    from_crate: Crate,
+    def: Definition<'_>,
+) -> String {
+    let nav = def.try_to_nav(sema).map(UpmappingResult::call_site);
+    let moniker = def_to_moniker(db, def, from_crate);
+    stable_definition_id(db, sema, def, nav.as_ref(), moniker.as_ref())
+}
+
+fn same_assoc_item_kind(left: AssocItem, right: AssocItem) -> bool {
+    matches!(
+        (left, right),
+        (AssocItem::Function(_), AssocItem::Function(_))
+            | (AssocItem::Const(_), AssocItem::Const(_))
+            | (AssocItem::TypeAlias(_), AssocItem::TypeAlias(_))
+    )
+}
+
+fn assoc_item_definition<'db>(item: AssocItem) -> Definition<'db> {
+    match item {
+        AssocItem::Function(item) => item.into(),
+        AssocItem::Const(item) => item.into(),
+        AssocItem::TypeAlias(item) => item.into(),
+    }
 }
 
 pub enum VendoredLibrariesConfig<'a> {
@@ -195,12 +589,32 @@ impl<'a> StaticIndex<'a> {
         };
         let mut result = StaticIndexedFile { file_id, folds, tokens: vec![] };
 
-        let mut add_token = |def: Definition<'a>, range: TextRange, scope_node: &SyntaxNode| {
+        let mut add_token = |def: Definition<'a>,
+                             range: TextRange,
+                             scope_node: &SyntaxNode,
+                             role: StaticReferenceRole| {
             let id = if let Some(it) = self.def_map.get(&def) {
                 *it
             } else {
                 let nav = def.try_to_nav(&sema).map(UpmappingResult::call_site);
+                let moniker = current_crate.and_then(|cc| def_to_moniker(self.db, def, cc));
+                let local = matches!(moniker, Some(MonikerResult::Local { .. }));
                 let it = self.tokens.insert(TokenStaticData {
+                    stable_id: stable_definition_id(
+                        self.db,
+                        &sema,
+                        def,
+                        nav.as_ref(),
+                        moniker.as_ref(),
+                    ),
+                    qualified_name: qualified_name(moniker.as_ref(), def, self.db, edition),
+                    exported: matches!(def.visibility(self.db), Some(hir::Visibility::Public)),
+                    external: nav.as_ref().is_some_and(|nav| {
+                        let source_root =
+                            self.db.file_source_root(nav.file_id).source_root_id(self.db);
+                        self.db.source_root(source_root).source_root(self.db).is_library
+                    }),
+                    local,
                     documentation: documentation_for_definition(&sema, def, scope_node),
                     hover: Some(hover_for_definition(
                         &sema,
@@ -223,7 +637,7 @@ impl<'a> StaticIndex<'a> {
                         range: definition_range_excluding_trivia(&sema, it.file_id, it.full_range),
                     }),
                     references: vec![],
-                    moniker: current_crate.and_then(|cc| def_to_moniker(self.db, def, cc)),
+                    moniker,
                     display_name: def
                         .name(self.db)
                         .map(|name| name.display(self.db, edition).to_string()),
@@ -240,6 +654,7 @@ impl<'a> StaticIndex<'a> {
                     Some(it) => it.file_id == file_id && it.focus_or_full_range() == range,
                     None => false,
                 },
+                role,
             });
             result.tokens.push((range, id));
         };
@@ -247,7 +662,7 @@ impl<'a> StaticIndex<'a> {
         if let Some(module) = sema.file_to_module_def(file_id) {
             let def = Definition::Module(module);
             let range = root.text_range();
-            add_token(def, range, &root);
+            add_token(def, range, &root, StaticReferenceRole::Reference);
         }
 
         for token in tokens {
@@ -255,8 +670,8 @@ impl<'a> StaticIndex<'a> {
             let node = token.parent().unwrap();
             match hir::attach_db(self.db, || get_definitions(&sema, token.clone())) {
                 Some(defs) => {
-                    for (def, _) in defs {
-                        add_token(def, range, &node);
+                    for (def, _, role) in defs {
+                        add_token(def, range, &node, role);
                     }
                 }
                 None => continue,
@@ -288,6 +703,7 @@ impl<'a> StaticIndex<'a> {
             let mut this = StaticIndex {
                 files: vec![],
                 tokens: Default::default(),
+                relations: Vec::new(),
                 analysis,
                 db,
                 def_map: Default::default(),
@@ -302,6 +718,34 @@ impl<'a> StaticIndex<'a> {
                 this.add_file(file_id);
                 visited_files.insert(file_id);
             }
+            this.relations = semantic_relations(db, None);
+            this
+        })
+    }
+
+    /// Computes semantic index data only for the requested source files.
+    ///
+    /// Referenced definitions are still resolved through the same immutable
+    /// database revision, so callers can rebuild source-owned shards without
+    /// fanning out through LSP requests or walking unrelated files.
+    pub fn compute_files(analysis: &'a Analysis, file_ids: &[FileId]) -> StaticIndex<'a> {
+        let db = &analysis.db;
+        hir::attach_db(db, || {
+            let mut this = StaticIndex {
+                files: vec![],
+                tokens: Default::default(),
+                relations: Vec::new(),
+                analysis,
+                db,
+                def_map: Default::default(),
+            };
+            let mut visited_files = FxHashSet::default();
+            for &file_id in file_ids {
+                if visited_files.insert(file_id) {
+                    this.add_file(file_id);
+                }
+            }
+            this.relations = semantic_relations(db, Some(&visited_files));
             this
         })
     }
@@ -366,7 +810,22 @@ mod tests {
     use ide_db::{FileRange, FxHashMap, FxHashSet, base_db::VfsPath};
     use syntax::TextSize;
 
-    use super::VendoredLibrariesConfig;
+    use super::{StaticRelationKind, VendoredLibrariesConfig};
+
+    fn graph_identities(ra_fixture: &str) -> Vec<(Option<String>, String)> {
+        let (analysis, _) = fixture::annotations_without_marker(ra_fixture);
+        let index = StaticIndex::compute(&analysis, VendoredLibrariesConfig::Excluded);
+        let mut identities = index
+            .tokens
+            .iter()
+            .filter_map(|(_, token)| {
+                token.definition?;
+                Some((token.qualified_name, token.stable_id))
+            })
+            .collect::<Vec<_>>();
+        identities.sort();
+        identities
+    }
 
     fn check_all_ranges(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
@@ -602,5 +1061,123 @@ struct Hello(i32);
                 workspace_root: &VfsPath::new_virtual_path("/workspace".to_owned()),
             },
         );
+    }
+
+    #[test]
+    fn graph_identity_is_semantic_and_position_invariant() {
+        let compact = graph_identities(
+            r#"
+//- /workspace/lib.rs crate:main@1.2.3,https://example.com/main.git
+pub struct Service;
+impl Service {
+    pub fn run(&self, input: i32) -> i32 {
+        let output = input + 1;
+        let scratch = 0;
+        let _ = scratch;
+        output
+    }
+}
+"#,
+        );
+        let moved = graph_identities(
+            r#"
+//- /workspace/lib.rs crate:main@1.2.3,https://example.com/main.git
+
+
+pub struct Service;
+
+impl Service {
+    pub fn run(
+        &self,
+        input: i32,
+    ) -> i32 {
+        let scratch = 0;
+        let _ = scratch;
+        let output = input + 1;
+        output
+    }
+}
+"#,
+        );
+
+        assert_eq!(compact, moved);
+        assert!(compact.iter().all(|(_, id)| id.starts_with("rust-hir-v1|")));
+        assert!(
+            compact.iter().any(|(name, _)| name.as_deref() == Some("impl::Service::run")),
+            "{compact:#?}"
+        );
+        assert!(
+            compact.iter().any(|(name, _)| name.as_deref() == Some("impl::Service::run::input")),
+            "{compact:#?}"
+        );
+    }
+
+    #[test]
+    fn graph_relations_come_from_hir_traits_and_impls() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- /workspace/lib.rs crate:main
+pub trait Parent {}
+pub trait Child: Parent {}
+
+pub struct Service;
+impl Child for Service {}
+
+pub trait Render {
+    fn render(&self) -> String;
+}
+impl Render for Service {
+    fn render(&self) -> String { String::new() }
+}
+"#,
+        );
+        let relations =
+            StaticIndex::compute(&analysis, VendoredLibrariesConfig::Excluded).relations;
+
+        assert!(relations.iter().any(|relation| relation.kind == StaticRelationKind::Extends));
+        assert!(relations.iter().any(|relation| relation.kind == StaticRelationKind::Implements));
+        assert!(relations.iter().any(|relation| relation.kind == StaticRelationKind::Overrides));
+        assert!(relations.iter().any(|relation| relation.kind == StaticRelationKind::Dispatches));
+        assert!(relations.iter().all(|relation| {
+            relation.from.starts_with("rust-hir-v1|") && relation.to.starts_with("rust-hir-v1|")
+        }));
+    }
+
+    #[test]
+    fn graph_reference_roles_keep_macro_expansion_context() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- /workspace/lib.rs crate:main
+macro_rules! invoke {
+    ($value:expr) => { $value };
+}
+pub trait Render { fn render(&self); }
+pub struct Service;
+impl Render for Service { fn render(&self) {} }
+pub fn run() { invoke!(Service.render()); }
+"#,
+        );
+        let index = StaticIndex::compute(&analysis, VendoredLibrariesConfig::Excluded);
+        let mut service_is_constructed = false;
+        let mut render_is_called = false;
+        for (_, token) in index.tokens.iter() {
+            match token.display_name.as_deref() {
+                Some("Service") => {
+                    service_is_constructed |= token
+                        .references
+                        .iter()
+                        .any(|reference| reference.role == super::StaticReferenceRole::Instantiate);
+                }
+                Some("render") => {
+                    render_is_called |= token
+                        .references
+                        .iter()
+                        .any(|reference| reference.role == super::StaticReferenceRole::Call);
+                }
+                _ => {}
+            }
+        }
+        assert!(service_is_constructed);
+        assert!(render_is_called);
     }
 }

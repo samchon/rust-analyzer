@@ -92,6 +92,7 @@ impl GlobalState {
     pub(crate) fn update_configuration(&mut self, config: Config) {
         let _p = tracing::info_span!("GlobalState::update_configuration").entered();
         let old_config = mem::replace(&mut self.config, Arc::new(config));
+        self.graph_snapshot_cache.lock().invalidate_all();
         if self.config.lru_parse_query_capacity() != old_config.lru_parse_query_capacity() {
             self.analysis_host.update_lru_capacity(self.config.lru_parse_query_capacity());
         }
@@ -514,6 +515,7 @@ impl GlobalState {
                     // Workspaces are the same, but we've updated build data.
                     info!("same workspace, but new build data");
                     self.workspaces = Arc::new(workspaces);
+                    self.graph_snapshot_cache.lock().invalidate_all();
                 } else {
                     info!("build scripts do not match the version of the active workspace");
                     if *force_crate_graph_reload {
@@ -539,6 +541,7 @@ impl GlobalState {
             // we don't care about build-script results, they are stale.
             // FIXME: can we abort the build scripts here if they are already running?
             self.workspaces = Arc::new(workspaces);
+            self.graph_snapshot_cache.lock().invalidate_all();
             self.check_workspaces_msrv().for_each(|message| {
                 self.send_notification::<lsp_types::ShowMessageNotification>(
                     lsp_types::ShowMessageParams { kind: lsp_types::MessageType::Warning, message },

@@ -187,6 +187,11 @@ pub fn server_capabilities(config: &Config) -> ServerCapabilities {
             "runnables": {
                 "kinds": [ "cargo" ],
             },
+            "samchonGraphSnapshot": {
+                "method": "samchon/graphSnapshot",
+                "protocolVersion": 1,
+                "schemaVersion": 1,
+            },
             "ssr": true,
             "workspaceSymbolScopeKindFiltering": true,
         })),
