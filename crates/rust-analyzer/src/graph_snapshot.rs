@@ -4,11 +4,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Instant,
 };
 
-use crossbeam_channel::Receiver;
 use ide::{
     AssistResolveStrategy, FileId, FileRange, Severity, StaticIndex, StaticReferenceRole,
     StaticRelationKind, SymbolInformationKind, VendoredLibrariesConfig,
@@ -66,7 +65,9 @@ pub(crate) struct GraphSnapshotCache {
     external_input_revision: u64,
     external_inputs_dirty: bool,
     external_input_watcher: Option<RecommendedWatcher>,
-    external_input_events: Option<Receiver<()>>,
+    external_input_event_fence: Arc<StdMutex<u64>>,
+    external_input_event_epoch: u64,
+    external_input_watcher_stale: bool,
 }
 
 impl Default for GraphSnapshotCache {
@@ -83,7 +84,9 @@ impl Default for GraphSnapshotCache {
             external_input_revision: 0,
             external_inputs_dirty: true,
             external_input_watcher: None,
-            external_input_events: None,
+            external_input_event_fence: Arc::new(StdMutex::new(0)),
+            external_input_event_epoch: 0,
+            external_input_watcher_stale: true,
         }
     }
 }
@@ -166,6 +169,9 @@ pub(crate) fn handle(
     let observed_universe = universe(&snap)?;
     let cached_response = {
         let mut cache = snap.graph_snapshot_cache.lock();
+        let event_fence = cache.external_input_event_fence.clone();
+        let event_guard = event_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        drain_external_input_events_at(&mut cache, *event_guard);
         if cache.committed.as_ref().is_some_and(|cached| cached.universe != observed_universe) {
             cache.invalidate_universe();
         }
@@ -259,6 +265,7 @@ pub(crate) fn handle(
     let shard_millis = elapsed_millis(shard_started);
 
     let encode_started = Instant::now();
+    ensure_external_inputs(&snap)?;
     validate_project_model_inputs(&snap)?;
     if universe(&snap)? != snapshot_universe {
         snap.graph_snapshot_cache.lock().invalidate_all();
@@ -267,6 +274,9 @@ pub(crate) fn handle(
         ));
     }
     let mut cache = snap.graph_snapshot_cache.lock();
+    let event_fence = cache.external_input_event_fence.clone();
+    let event_guard = event_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    drain_external_input_events_at(&mut cache, *event_guard);
     ensure_cache_revision(
         &cache,
         revision,
@@ -282,6 +292,7 @@ pub(crate) fn handle(
             cache_hit: true,
         };
         drop(cache);
+        drop(event_guard);
         return Ok(response.into_result());
     }
     let mut merged = if full_rebuild {
@@ -361,6 +372,7 @@ pub(crate) fn handle(
     cache.dirty_files.clear();
     cache.full_rebuild = false;
     drop(cache);
+    drop(event_guard);
     Ok(response.into_result())
 }
 
@@ -447,6 +459,7 @@ fn checkpoint_response(
             "persisted graph checkpoint manifest is invalid; rebuild and retry",
         ));
     }
+    ensure_external_inputs(snap)?;
     validate_project_model_inputs(snap)?;
     if universe(snap)? != *snapshot_universe {
         return Err(retry_error(
@@ -454,6 +467,9 @@ fn checkpoint_response(
         ));
     }
     let mut cache = snap.graph_snapshot_cache.lock();
+    let event_fence = cache.external_input_event_fence.clone();
+    let event_guard = event_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    drain_external_input_events_at(&mut cache, *event_guard);
     if let Some(committed) = cache.current() {
         return Ok(response_plan(committed, params.known_generation.as_deref(), true).into_result());
     }
@@ -696,55 +712,24 @@ fn ensure_external_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<()> {
     let cached_inputs = {
         let mut cache = snap.graph_snapshot_cache.lock();
         drain_external_input_events(&mut cache);
-        (cache.external_inputs == input_fingerprint && cache.external_input_watcher.is_some())
+        (cache.external_inputs == input_fingerprint
+            && cache.external_input_watcher.is_some()
+            && !cache.external_input_watcher_stale)
             .then(|| cache.external_input_roots.clone())
     };
     let inputs = if let Some(inputs) = cached_inputs {
         inputs
     } else {
         let inputs = external_graph_inputs(snap);
-        let (event_sender, event_receiver) = crossbeam_channel::bounded(1);
-        let mut watcher = RecommendedWatcher::new(
-            move |event: notify::Result<notify::Event>| {
-                if event.as_ref().is_ok_and(|event| matches!(event.kind, EventKind::Access(_))) {
-                    return;
-                }
-                let _ = event_sender.try_send(());
-            },
-            NotifyConfig::default().with_follow_symlinks(true),
-        )
-        .map_err(|error| {
-            retry_error(&format!(
-                "external graph-input watcher could not start: {error}; retry the request"
-            ))
-        })?;
-        for root in inputs.iter().map(|input| &input.root).collect::<BTreeSet<_>>() {
-            let mode = if fs::metadata(root)
-                .map_err(|error| {
-                    retry_error(&format!(
-                        "external graph input {} is unavailable: {error}; retry the request",
-                        root.display()
-                    ))
-                })?
-                .is_dir()
-            {
-                RecursiveMode::Recursive
-            } else {
-                RecursiveMode::NonRecursive
-            };
-            watcher.watch(root, mode).map_err(|error| {
-                retry_error(&format!(
-                    "external graph input {} could not be watched: {error}; retry the request",
-                    root.display()
-                ))
-            })?;
-        }
+        let event_fence = snap.graph_snapshot_cache.lock().external_input_event_fence.clone();
+        let watcher =
+            external_input_watcher(&event_fence, inputs.iter().map(|input| input.root.clone()))?;
         let mut cache = snap.graph_snapshot_cache.lock();
         cache.external_inputs = input_fingerprint.clone();
         cache.external_input_roots = inputs.clone();
         cache.external_inputs_dirty = true;
         cache.external_input_watcher = Some(watcher);
-        cache.external_input_events = Some(event_receiver);
+        cache.external_input_watcher_stale = false;
         inputs
     };
 
@@ -759,18 +744,39 @@ fn ensure_external_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<()> {
         }
         cache.external_input_revision
     };
-    let digest = external_inputs_digest(&inputs);
+    let capture = capture_external_inputs(&inputs);
+    let replacement = capture.as_ref().ok().map(|capture| {
+        let roots = inputs
+            .iter()
+            .map(|input| input.root.clone())
+            .chain(capture.symlink_watch_roots.iter().cloned());
+        let event_fence = snap.graph_snapshot_cache.lock().external_input_event_fence.clone();
+        external_input_watcher(&event_fence, roots)
+    });
+    let replacement = match replacement {
+        Some(watcher) => Some(watcher?),
+        None => None,
+    };
     let mut cache = snap.graph_snapshot_cache.lock();
-    drain_external_input_events(&mut cache);
+    let event_fence = cache.external_input_event_fence.clone();
+    let event_guard = event_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    drain_external_input_events_at(&mut cache, *event_guard);
     if cache.external_inputs != input_fingerprint || cache.external_input_revision != revision {
         return Err(retry_error(
             "external graph inputs moved while they were being captured; retry the request",
         ));
     }
-    match digest {
-        Ok(digest) => {
-            cache.external_input_digest = Ok(digest);
+    match capture {
+        Ok(capture) => {
+            cache.external_input_digest = Ok(capture.digest);
             cache.external_inputs_dirty = false;
+            let retired_watcher = cache.external_input_watcher.replace(
+                replacement.expect("a successful capture always builds a replacement watcher"),
+            );
+            cache.external_input_watcher_stale = false;
+            drop(event_guard);
+            drop(cache);
+            drop(retired_watcher);
             Ok(())
         }
         Err(error) => {
@@ -784,38 +790,105 @@ fn ensure_external_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<()> {
 }
 
 fn drain_external_input_events(cache: &mut GraphSnapshotCache) {
-    let changed = cache
-        .external_input_events
-        .as_ref()
-        .is_some_and(|events| events.try_iter().next().is_some());
-    if changed {
+    let event_fence = cache.external_input_event_fence.clone();
+    let event_guard = event_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    drain_external_input_events_at(cache, *event_guard);
+}
+
+fn drain_external_input_events_at(cache: &mut GraphSnapshotCache, event_epoch: u64) {
+    if cache.external_input_event_epoch != event_epoch {
+        cache.external_input_event_epoch = event_epoch;
         cache.external_input_revision = cache.external_input_revision.wrapping_add(1);
         cache.external_inputs_dirty = true;
+        cache.external_input_watcher_stale = true;
         cache.invalidate_all();
     }
 }
 
-fn external_inputs_digest(inputs: &[ExternalGraphInput]) -> anyhow::Result<String> {
-    let mut content = Vec::<(String, Vec<u8>)>::new();
+fn external_input_watcher(
+    event_fence: &Arc<StdMutex<u64>>,
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> anyhow::Result<RecommendedWatcher> {
+    let event_fence = Arc::clone(event_fence);
+    let mut watcher = RecommendedWatcher::new(
+        move |event: notify::Result<notify::Event>| {
+            if event.as_ref().is_ok_and(|event| matches!(event.kind, EventKind::Access(_))) {
+                return;
+            }
+            let mut epoch = event_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *epoch = epoch.wrapping_add(1);
+        },
+        NotifyConfig::default().with_follow_symlinks(false),
+    )
+    .map_err(|error| {
+        retry_error(&format!(
+            "external graph-input watcher could not start: {error}; retry the request"
+        ))
+    })?;
+    for root in roots.into_iter().collect::<BTreeSet<_>>() {
+        let mode = if fs::metadata(&root)
+            .map_err(|error| {
+                retry_error(&format!(
+                    "external graph input {} is unavailable: {error}; retry the request",
+                    root.display()
+                ))
+            })?
+            .is_dir()
+        {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        watcher.watch(&root, mode).map_err(|error| {
+            retry_error(&format!(
+                "external graph input {} could not be watched: {error}; retry the request",
+                root.display()
+            ))
+        })?;
+    }
+    Ok(watcher)
+}
+
+struct ExternalInputCapture {
+    digest: String,
+    symlink_watch_roots: BTreeSet<PathBuf>,
+}
+
+fn capture_external_inputs(inputs: &[ExternalGraphInput]) -> anyhow::Result<ExternalInputCapture> {
+    let mut content = BTreeMap::<String, Vec<u8>>::new();
+    let mut symlink_watch_roots = BTreeSet::new();
     for input in inputs {
         for entry in WalkDir::new(&input.root).follow_links(true) {
-            let entry = entry.map_err(anyhow::Error::from)?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    let Some(path) = error.path() else {
+                        return Err(error.into());
+                    };
+                    if fs::symlink_metadata(path)
+                        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                    {
+                        capture_symlink(input, path, &mut content, &mut symlink_watch_roots)?;
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+            };
             let path = entry.path();
             let relative = path.strip_prefix(&input.root).unwrap_or(path);
             let key =
                 format!("{}:{}", input.identity, relative.to_string_lossy().replace('\\', "/"));
             if entry.path_is_symlink() {
-                content.push((
-                    format!("{key}:symlink"),
-                    fs::read_link(path)?.to_string_lossy().as_bytes().to_vec(),
-                ));
+                capture_symlink(input, path, &mut content, &mut symlink_watch_roots)?;
+                if fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+                    content.insert(format!("{key}:file"), fs::read(path)?);
+                }
             }
             if entry.file_type().is_file() {
-                content.push((format!("{key}:file"), fs::read(path)?));
+                content.insert(format!("{key}:file"), fs::read(path)?);
             }
         }
     }
-    content.sort_by(|left, right| left.0.cmp(&right.0));
     let mut digest = Sha256::new();
     for (key, bytes) in content {
         digest.update((key.len() as u64).to_le_bytes());
@@ -823,7 +896,36 @@ fn external_inputs_digest(inputs: &[ExternalGraphInput]) -> anyhow::Result<Strin
         digest.update((bytes.len() as u64).to_le_bytes());
         digest.update(bytes);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(ExternalInputCapture { digest: format!("{:x}", digest.finalize()), symlink_watch_roots })
+}
+
+fn capture_symlink(
+    input: &ExternalGraphInput,
+    path: &std::path::Path,
+    content: &mut BTreeMap<String, Vec<u8>>,
+    watch_roots: &mut BTreeSet<PathBuf>,
+) -> anyhow::Result<()> {
+    let target = fs::read_link(path)?;
+    let relative = path.strip_prefix(&input.root).unwrap_or(path);
+    let key = format!("{}:{}", input.identity, relative.to_string_lossy().replace('\\', "/"));
+    content.insert(format!("{key}:symlink"), target.to_string_lossy().as_bytes().to_vec());
+    let target =
+        if target.is_absolute() { target } else { path.parent().unwrap_or(path).join(target) };
+    if let Some(root) = nearest_existing_watch_root(target) {
+        watch_roots.insert(root);
+    }
+    Ok(())
+}
+
+fn nearest_existing_watch_root(mut path: PathBuf) -> Option<PathBuf> {
+    loop {
+        if fs::metadata(&path).is_ok() {
+            return Some(path);
+        }
+        if !path.pop() {
+            return None;
+        }
+    }
 }
 
 fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse> {
@@ -1779,9 +1881,9 @@ mod tests {
     };
 
     use super::{
-        CachedSnapshot, ExternalGraphInput, GraphSnapshotCache, digest_json,
-        drain_external_input_events, ensure_cache_revision, external_inputs_digest,
-        interfaces_changed, response_for, shard_digest, write_canonical_json,
+        CachedSnapshot, ExternalGraphInput, GraphSnapshotCache, capture_external_inputs,
+        digest_json, drain_external_input_events, ensure_cache_revision, interfaces_changed,
+        nearest_existing_watch_root, response_for, shard_digest, write_canonical_json,
     };
 
     #[test]
@@ -1960,21 +2062,22 @@ mod tests {
 
     #[test]
     fn external_input_events_invalidate_resident_snapshots_once_drained() {
-        let (sender, receiver) = crossbeam_channel::bounded(1);
         let mut cache = GraphSnapshotCache {
             full_rebuild: false,
             external_inputs_dirty: false,
-            external_input_events: Some(receiver),
+            external_input_watcher_stale: false,
             ..GraphSnapshotCache::default()
         };
         let revision = cache.revision();
-        sender.send(()).unwrap();
+        *cache.external_input_event_fence.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            1;
 
         drain_external_input_events(&mut cache);
 
         assert_eq!(cache.revision(), revision.wrapping_add(1));
         assert_eq!(cache.external_input_revision, 1);
         assert!(cache.external_inputs_dirty);
+        assert!(cache.external_input_watcher_stale);
         assert!(cache.full_rebuild);
     }
 
@@ -1992,16 +2095,26 @@ mod tests {
             identity: identity.to_owned(),
             root: root.clone(),
         };
-        let initial = external_inputs_digest(&[dependency("package-a")]).unwrap();
+        let initial = capture_external_inputs(&[dependency("package-a")]).unwrap().digest;
         fs::write(root.join(".git/config"), "semantic-input-b\n").unwrap();
-        let hidden = external_inputs_digest(&[dependency("package-a")]).unwrap();
+        let hidden = capture_external_inputs(&[dependency("package-a")]).unwrap().digest;
         fs::write(root.join("target/generated.rs"), "pub const GENERATED: u8 = 2;\n").unwrap();
-        let generated = external_inputs_digest(&[dependency("package-a")]).unwrap();
-        let renamed_package = external_inputs_digest(&[dependency("package-b")]).unwrap();
+        let generated = capture_external_inputs(&[dependency("package-a")]).unwrap().digest;
+        let renamed_package = capture_external_inputs(&[dependency("package-b")]).unwrap().digest;
 
         assert_ne!(initial, hidden);
         assert_ne!(hidden, generated);
         assert_ne!(generated, renamed_package);
+    }
+
+    #[test]
+    fn a_missing_symlink_target_watches_its_nearest_existing_ancestor() {
+        let directory = temp_dir::TempDir::new().unwrap();
+        let root = directory.path().to_path_buf();
+        assert_eq!(
+            nearest_existing_watch_root(root.join("missing/dependency/generated.rs")),
+            Some(root),
+        );
     }
 
     #[cfg(unix)]
@@ -2016,9 +2129,29 @@ mod tests {
         symlink(root.join("real"), root.join("linked")).unwrap();
         let dependencies =
             [ExternalGraphInput { identity: "package".to_owned(), root: root.clone() }];
-        let initial = external_inputs_digest(&dependencies).unwrap();
+        let initial = capture_external_inputs(&dependencies).unwrap().digest;
         fs::write(root.join("real/generated.rs"), "pub const GENERATED: u8 = 2;\n").unwrap();
-        let changed = external_inputs_digest(&dependencies).unwrap();
+        let changed = capture_external_inputs(&dependencies).unwrap().digest;
         assert_ne!(initial, changed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_input_digest_fences_broken_and_cyclic_symlinks_without_failing() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temp_dir::TempDir::new().unwrap();
+        let root = directory.path().to_path_buf();
+        symlink("missing.rs", root.join("broken.rs")).unwrap();
+        symlink(".", root.join("cycle")).unwrap();
+        let inputs = [ExternalGraphInput { identity: "package".to_owned(), root: root.clone() }];
+
+        let initial = capture_external_inputs(&inputs).unwrap();
+        fs::remove_file(root.join("broken.rs")).unwrap();
+        symlink("other-missing.rs", root.join("broken.rs")).unwrap();
+        let changed = capture_external_inputs(&inputs).unwrap();
+
+        assert_ne!(initial.digest, changed.digest);
+        assert!(initial.symlink_watch_roots.contains(&root));
     }
 }
