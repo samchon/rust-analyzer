@@ -50,6 +50,13 @@ pub struct StaticRelation {
     pub file_id: FileId,
     pub from: String,
     pub to: String,
+    pub to_display_name: Option<String>,
+    pub to_qualified_name: Option<String>,
+    pub to_signature: String,
+    pub to_kind: SymbolInformationKind,
+    pub to_external: bool,
+    pub to_exported: bool,
+    pub to_definition_file: Option<FileId>,
     pub kind: StaticRelationKind,
 }
 
@@ -772,10 +779,24 @@ fn relation(
     to: Definition<'_>,
     kind: StaticRelationKind,
 ) -> StaticRelation {
+    let nav = to.try_to_nav(sema).map(UpmappingResult::call_site);
+    let moniker = def_to_moniker(db, to, from_crate);
+    let edition = from_crate.edition(db);
+    let display_target = from_crate.to_display_target(db);
     StaticRelation {
         file_id,
         from: stable_id_for_definition(db, sema, from_crate, from),
-        to: stable_id_for_definition(db, sema, from_crate, to),
+        to: stable_definition_id(db, sema, to, nav.as_ref(), moniker.as_ref()),
+        to_display_name: to.name(db).map(|name| name.display(db, edition).to_string()),
+        to_qualified_name: qualified_name(moniker.as_ref(), to, db, edition),
+        to_signature: to.label(db, display_target),
+        to_kind: def_to_kind(db, to),
+        to_external: nav.as_ref().is_none_or(|nav| {
+            let source_root = db.file_source_root(nav.file_id).source_root_id(db);
+            db.source_root(source_root).source_root(db).is_library
+        }),
+        to_exported: is_effectively_exported(db, to),
+        to_definition_file: nav.as_ref().map(|nav| nav.file_id),
         kind,
     }
 }
@@ -1489,6 +1510,40 @@ impl Render for Service {
         assert!(relations.iter().all(|relation| {
             relation.from.starts_with("rust-hir-v1|") && relation.to.starts_with("rust-hir-v1|")
         }));
+        assert!(relations.iter().all(|relation| {
+            relation.to_display_name.is_some()
+                && relation.to_qualified_name.is_some()
+                && !relation.to_signature.is_empty()
+                && !relation.to_external
+                && relation.to_exported
+                && relation.to_definition_file.is_some()
+        }));
+    }
+
+    #[test]
+    fn graph_relations_describe_external_endpoints() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- minicore: fmt
+//- /workspace/lib.rs crate:main
+struct Value;
+impl core::fmt::Debug for Value {}
+"#,
+        );
+        let relations =
+            StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded).relations;
+        let relation = relations
+            .iter()
+            .find(|relation| relation.kind == StaticRelationKind::Implements)
+            .unwrap();
+
+        assert_eq!(relation.to_display_name.as_deref(), Some("Debug"));
+        assert_eq!(relation.to_kind, crate::SymbolInformationKind::Trait);
+        assert!(relation.to_qualified_name.as_deref().is_some_and(|name| name.ends_with("Debug")));
+        assert!(relation.to_signature.contains("Debug"));
+        assert!(relation.to_external);
+        assert!(relation.to_exported);
+        assert!(relation.to_definition_file.is_some());
     }
 
     #[test]

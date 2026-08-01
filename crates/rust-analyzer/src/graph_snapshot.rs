@@ -1416,6 +1416,12 @@ fn compute_interface_fingerprints(
                 "relation": format!("{:?}", relation.kind),
                 "from": relation.from,
                 "to": relation.to,
+                "toDisplayName": relation.to_display_name,
+                "toQualifiedName": relation.to_qualified_name,
+                "toSignature": relation.to_signature,
+                "toKind": format!("{:?}", relation.to_kind),
+                "toExternal": relation.to_external,
+                "toExported": relation.to_exported,
             }))?);
         }
     }
@@ -1644,6 +1650,25 @@ fn build_shards(
         else {
             continue;
         };
+        if !id_sources.contains_key(&relation.to) {
+            let Some(name) = relation.to_display_name.clone() else {
+                continue;
+            };
+            let target_source =
+                relation.to_definition_file.and_then(|file_id| sources.get(&file_id).cloned());
+            shards.get_mut(source).unwrap().nodes.push(GraphSnapshotNode {
+                id: relation.to.clone(),
+                kind: graph_node_kind(relation.to_kind).to_owned(),
+                name,
+                qualified_name: relation.to_qualified_name.clone(),
+                file: target_source.clone().unwrap_or_else(|| dependency_source.clone()),
+                external: relation.to_external || target_source.is_none(),
+                exported: relation.to_exported,
+                signature: Some(relation.to_signature.clone()),
+                evidence: None,
+            });
+            id_sources.insert(relation.to.clone(), source.clone());
+        }
         let kind = match relation.kind {
             StaticRelationKind::Extends => "extends",
             StaticRelationKind::Implements => "implements",
