@@ -167,6 +167,7 @@ pub(crate) fn handle(
         ));
     }
     let started = Instant::now();
+    let source_inputs = validate_source_inputs(&snap)?;
     ensure_external_inputs(&snap)?;
     validate_project_model_inputs(&snap)?;
     let observed_universe = universe(&snap)?;
@@ -188,7 +189,8 @@ pub(crate) fn handle(
         return Ok(result);
     }
     if let Some(checkpoint) = params.checkpoint.as_ref() {
-        let mut result = checkpoint_response(&snap, &observed_universe, checkpoint, &params)?;
+        let mut result =
+            checkpoint_response(&snap, &observed_universe, checkpoint, &params, &source_inputs)?;
         result.phases.total_millis = elapsed_millis(started);
         return Ok(result);
     }
@@ -264,10 +266,17 @@ pub(crate) fn handle(
         }
         cached
     };
-    let shards = build_shards(&snap, index, &snapshot_universe, &interface_fingerprints)?;
+    let shards =
+        build_shards(&snap, index, &snapshot_universe, &interface_fingerprints, &source_inputs)?;
     let shard_millis = elapsed_millis(shard_started);
 
     let encode_started = Instant::now();
+    if validate_source_inputs(&snap)? != source_inputs {
+        snap.graph_snapshot_cache.lock().invalidate_all();
+        return Err(retry_error(
+            "graph snapshot source inputs moved while it was being built; retry the request",
+        ));
+    }
     ensure_external_inputs(&snap)?;
     validate_project_model_inputs(&snap)?;
     if universe(&snap)? != snapshot_universe {
@@ -384,6 +393,7 @@ fn checkpoint_response(
     snapshot_universe: &GraphSnapshotUniverse,
     checkpoint: &GraphSnapshotCheckpoint,
     params: &GraphSnapshotParams,
+    source_inputs: &BTreeMap<FileId, String>,
 ) -> anyhow::Result<GraphSnapshotResult> {
     if checkpoint.protocol_version != PROTOCOL_VERSION
         || checkpoint.schema_version != SCHEMA_VERSION
@@ -395,15 +405,10 @@ fn checkpoint_response(
             "persisted graph checkpoint does not match this producer universe; rebuild and retry",
         ));
     }
-    let expected_sources =
-        StaticIndex::graph_source_files(&snap.analysis, VendoredLibrariesConfig::Excluded)
-            .into_iter()
-            .map(|file_id| {
-                let source = source_path(snap, file_id);
-                let text = snap.analysis.file_text(file_id)?;
-                Ok((source, digest_bytes(text.as_bytes())))
-            })
-            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+    let expected_sources = source_inputs
+        .iter()
+        .map(|(&file_id, digest)| (source_path(snap, file_id), digest.clone()))
+        .collect::<BTreeMap<_, _>>();
     let actual_sources = checkpoint
         .sources
         .iter()
@@ -537,6 +542,51 @@ fn validate_project_model_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<(
         }
     }
     Ok(())
+}
+
+fn validate_source_inputs(snap: &GlobalStateSnapshot) -> anyhow::Result<BTreeMap<FileId, String>> {
+    StaticIndex::graph_source_files(&snap.analysis, VendoredLibrariesConfig::Excluded)
+        .into_iter()
+        .map(|file_id| {
+            let text = snap.analysis.file_text(file_id)?;
+            Ok((file_id, checker_source_digest(snap, file_id, &text)?))
+        })
+        .collect()
+}
+
+fn checker_source_digest(
+    snap: &GlobalStateSnapshot,
+    file_id: FileId,
+    checker_text: &str,
+) -> anyhow::Result<String> {
+    let file = snap.file_id_to_file_path(file_id);
+    let path = file.as_path().ok_or_else(|| {
+        retry_error(&format!("graph source {} has no disk identity; retry after saving it", file))
+    })?;
+    checker_disk_digest(path.as_ref(), checker_text)
+}
+
+fn checker_disk_digest(path: &Path, checker_text: &str) -> anyhow::Result<String> {
+    let bytes = fs::read(path).map_err(|error| {
+        retry_error(&format!(
+            "graph source {} is unavailable on disk: {error}; retry the request",
+            path.display()
+        ))
+    })?;
+    let disk_text = String::from_utf8(bytes.clone()).map_err(|error| {
+        retry_error(&format!(
+            "graph source {} is not UTF-8: {error}; retry the request",
+            path.display()
+        ))
+    })?;
+    let (normalized, _) = crate::line_index::LineEndings::normalize(disk_text);
+    if normalized != checker_text {
+        return Err(retry_error(&format!(
+            "graph source {} moved beyond the analyzer VFS; retry the request",
+            path.display()
+        )));
+    }
+    Ok(digest_bytes(&bytes))
 }
 
 #[cfg(test)]
@@ -1459,6 +1509,7 @@ fn build_shards(
     index: StaticIndex<'_>,
     universe: &GraphSnapshotUniverse,
     interface_fingerprints: &BTreeMap<String, String>,
+    source_inputs: &BTreeMap<FileId, String>,
 ) -> anyhow::Result<Vec<GraphSnapshotShard>> {
     let files = index.files;
     let relations = index.relations;
@@ -1472,8 +1523,12 @@ fn build_shards(
         .collect::<BTreeSet<_>>();
     for file in &files {
         let source = source_path(snap, file.file_id);
-        let text = snap.analysis.file_text(file.file_id)?;
-        source_digests.insert(source.clone(), digest_bytes(text.as_bytes()));
+        source_digests.insert(
+            source.clone(),
+            source_inputs.get(&file.file_id).cloned().ok_or_else(|| {
+                retry_error("graph source set moved beyond its validated disk inputs; retry")
+            })?,
+        );
         sources.insert(file.file_id, source);
     }
 
@@ -2158,7 +2213,7 @@ mod tests {
 
     use super::{
         CachedSnapshot, ExternalGraphInput, GraphSnapshotCache, capture_external_inputs,
-        digest_json, drain_external_input_events, ensure_cache_revision,
+        checker_disk_digest, digest_json, drain_external_input_events, ensure_cache_revision,
         external_input_watch_roots, interfaces_changed, nearest_existing_watch_root,
         resolve_external_tool_path, response_for, shard_digest, write_canonical_json,
     };
@@ -2430,6 +2485,20 @@ mod tests {
 
         assert!(error.to_string().contains("unavailable on PATH"));
         assert!(!error.to_string().contains(&workspace.display().to_string()));
+    }
+
+    #[test]
+    fn checker_source_digests_preserve_exact_disk_line_endings() {
+        let directory = temp_dir::TempDir::new().unwrap();
+        let source = directory.path().join("lib.rs");
+        let bytes = b"pub fn answer() -> u8 {\r\n    42\r\n}\r\n";
+        fs::write(&source, bytes).unwrap();
+
+        assert_eq!(
+            checker_disk_digest(&source, "pub fn answer() -> u8 {\n    42\n}\n").unwrap(),
+            super::digest_bytes(bytes),
+        );
+        assert!(checker_disk_digest(&source, "pub fn answer() -> u8 { 0 }\n").is_err());
     }
 
     #[test]
