@@ -9,6 +9,7 @@ use paths::{AbsPath, AbsPathBuf, Utf8Path, Utf8PathBuf};
 use rustc_hash::FxHashMap;
 use serde::de::DeserializeOwned;
 use span::FileId;
+use triomphe::Arc;
 
 use crate::{
     CargoWorkspace, CfgOverrides, ManifestPath, ProjectJson, ProjectJsonData, ProjectWorkspace,
@@ -42,6 +43,9 @@ fn load_workspace_from_metadata(file: &str) -> ProjectWorkspace {
             rustc: Err(None),
             error: None,
         },
+        graph_lockfile: None,
+        graph_project_inputs: Vec::new(),
+        graph_rustc_version: Ok("test-rustc".into()),
         cfg_overrides: Default::default(),
         sysroot: Sysroot::empty(),
         rustc_cfg: Vec::new(),
@@ -52,12 +56,28 @@ fn load_workspace_from_metadata(file: &str) -> ProjectWorkspace {
     }
 }
 
+#[test]
+fn graph_project_inputs_participate_in_workspace_identity() {
+    let left = load_workspace_from_metadata("hello-world-metadata.json");
+    let mut right = left.clone();
+    right.graph_project_inputs.push((
+        AbsPathBuf::assert_utf8(std::env::current_dir().unwrap().join("Cargo.toml")),
+        Some(Arc::from(&b"[workspace]\n"[..])),
+    ));
+
+    assert!(!left.eq_ignore_build_data(&right));
+    assert_ne!(left.graph_semantic_descriptor(), right.graph_semantic_descriptor());
+}
+
 fn load_rust_project(file: &str) -> (CrateGraphBuilder, ProcMacroPaths) {
     let data = get_test_json_file(file);
     let project = rooted_project_json(data);
     let sysroot = Sysroot::empty();
     let project_workspace = ProjectWorkspace {
         kind: ProjectWorkspaceKind::Json(project),
+        graph_lockfile: None,
+        graph_project_inputs: Vec::new(),
+        graph_rustc_version: Ok("test-rustc".into()),
         sysroot,
         rustc_cfg: Vec::new(),
         toolchain: None,
@@ -67,6 +87,43 @@ fn load_rust_project(file: &str) -> (CrateGraphBuilder, ProcMacroPaths) {
         set_test: true,
     };
     to_crate_graph(project_workspace, &mut Default::default())
+}
+
+#[test]
+fn non_cargo_crates_receive_workspace_distinct_graph_identities() {
+    let (project_graph, _) = load_rust_project("hello-world-project.json");
+    let project_identities = project_graph
+        .iter()
+        .filter_map(|krate| project_graph[krate].extra.graph_identity.as_deref())
+        .collect::<Vec<_>>();
+    assert!(!project_identities.is_empty());
+    assert!(project_identities.iter().all(|identity| identity.starts_with("project-json=")));
+
+    let directory = temp_dir::TempDir::new().unwrap();
+    let detached =
+        ManifestPath::try_from(AbsPathBuf::assert_utf8(directory.path().join("standalone.rs")))
+            .unwrap();
+    let detached_workspace = ProjectWorkspace {
+        kind: ProjectWorkspaceKind::DetachedFile { file: detached.clone(), cargo: None },
+        graph_lockfile: None,
+        graph_project_inputs: Vec::new(),
+        graph_rustc_version: Ok("test-rustc".into()),
+        sysroot: Sysroot::empty(),
+        rustc_cfg: Vec::new(),
+        toolchain: None,
+        target: Err("test has no target data".into()),
+        cfg_overrides: Default::default(),
+        extra_includes: Vec::new(),
+        set_test: true,
+    };
+    let (detached_graph, _) = to_crate_graph(detached_workspace, &mut Default::default());
+    let identities = detached_graph
+        .iter()
+        .filter_map(|krate| {
+            detached_graph[krate].extra.graph_identity.as_deref().map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(identities, [format!("detached-file={detached}")]);
 }
 
 fn get_test_json_file<T: DeserializeOwned>(file: &str) -> T {
@@ -270,6 +327,9 @@ fn smoke_test_real_sysroot_cargo() {
             rustc: Err(None),
             error: None,
         },
+        graph_lockfile: None,
+        graph_project_inputs: Vec::new(),
+        graph_rustc_version: Ok("test-rustc".into()),
         sysroot,
         rustc_cfg: Vec::new(),
         cfg_overrides: Default::default(),

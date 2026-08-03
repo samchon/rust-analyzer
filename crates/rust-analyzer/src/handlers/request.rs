@@ -126,6 +126,13 @@ pub(crate) fn handle_analyzer_status(
     Ok(buf)
 }
 
+pub(crate) fn handle_graph_snapshot(
+    snap: GlobalStateSnapshot,
+    params: lsp_ext::GraphSnapshotParams,
+) -> anyhow::Result<lsp_ext::GraphSnapshotResult> {
+    crate::graph_snapshot::handle(snap, params)
+}
+
 pub(crate) fn handle_memory_usage(_state: &mut GlobalState, _: ()) -> anyhow::Result<String> {
     let _p = tracing::info_span!("handle_memory_usage").entered();
 

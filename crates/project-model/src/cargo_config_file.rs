@@ -46,6 +46,24 @@ impl CargoConfigFile {
         CargoConfigFileReader::new(&self.0)
     }
 
+    /// Exact configuration files Cargo reported while merging its effective
+    /// configuration. Environment and inline `--config` origins have no disk
+    /// identity and are intentionally excluded.
+    pub(crate) fn graph_input_paths(&self) -> Vec<Utf8PathBuf> {
+        self.0
+            .lines()
+            .filter_map(|line| line.rsplit_once(" # ").map(|(_, origin)| origin.trim()))
+            .filter(|origin| {
+                !origin.starts_with("environment variable")
+                    && !origin.starts_with("--config cli option")
+            })
+            .filter_map(|origin| {
+                let path = Utf8PathBuf::from(origin);
+                path.is_absolute().then_some(path)
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn from_string_for_test(s: String) -> Self {
         CargoConfigFile(s)
@@ -238,6 +256,10 @@ env.CARGO_WORKSPACE_DIR.value = "" # {root}/home/.cargo/config.toml
     );
 
     let reader = CargoConfigFileReader::new(&toml).unwrap();
+    let origins = CargoConfigFile(toml.clone()).graph_input_paths();
+    assert!(origins.iter().any(|path| path.as_str() == format!("{root}/home/.cargo/config.toml")));
+    assert!(origins.iter().any(|path| path.as_str() == format!("{root}/foo/.cargo/config.toml")));
+    assert!(!origins.iter().any(|path| path.as_str().contains("environment variable")));
 
     let alias_foo = reader.get_spanned(["alias", "foo"]).unwrap();
     assert_eq!(alias_foo.as_ref().as_str().unwrap(), "abc");

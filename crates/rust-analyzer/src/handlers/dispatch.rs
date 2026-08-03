@@ -152,6 +152,37 @@ impl RequestDispatcher<'_> {
         self.on_with_thread_intent::<false, false, R>(ThreadIntent::Worker, f, on_cancelled)
     }
 
+    /// Dispatches a graph request only after the complete semantic universe is
+    /// settled. Unlike [`Self::on`], an early request receives a retryable
+    /// error instead of a default-constructed success payload.
+    pub(crate) fn on_vfs_ready<const ALLOW_RETRYING: bool, R>(
+        &mut self,
+        f: fn(GlobalStateSnapshot, R::Params) -> anyhow::Result<R::Result>,
+    ) -> &mut Self
+    where
+        R: lsp_types::Request + 'static,
+        R::Params: DeserializeOwned + panic::UnwindSafe + Send + fmt::Debug,
+        R::Result: Serialize,
+    {
+        if !self.global_state.is_graph_snapshot_ready() {
+            if let Some(lsp_server::Request { id, .. }) =
+                self.req.take_if(|it| it.method.as_str() == R::METHOD.as_str())
+            {
+                self.global_state.respond(lsp_server::Response::new_err(
+                    id,
+                    lsp_server::ErrorCode::ServerCancelled as i32,
+                    "semantic workspace is still loading; retry the request".to_owned(),
+                ));
+            }
+            return self;
+        }
+        self.on_with_thread_intent::<false, ALLOW_RETRYING, R>(
+            ThreadIntent::Worker,
+            f,
+            Self::content_modified_error,
+        )
+    }
+
     /// Dispatches a non-latency-sensitive request onto the thread pool. When the VFS is marked not
     /// ready this will return the parameter as is.
     pub(crate) fn on_identity<const ALLOW_RETRYING: bool, R, Params>(

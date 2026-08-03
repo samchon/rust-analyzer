@@ -7,7 +7,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, after, select};
 use itertools::Itertools;
-use lsp_server::{Connection, Message, Notification, Request};
+use lsp_server::{Connection, Message, Notification, Request, ResponseError};
 use lsp_types::{
     ExitNotification, PublishDiagnosticsParams, ShutdownRequest, TextDocumentIdentifier, Uri,
 };
@@ -357,6 +357,16 @@ impl Server {
         R: lsp_types::Request,
         R::Params: Serialize,
     {
+        self.send_request_result::<R>(params)
+            .unwrap_or_else(|err| panic!("error response: {err:#?}"))
+    }
+
+    #[track_caller]
+    pub(crate) fn send_request_result<R>(&self, params: R::Params) -> Result<Value, ResponseError>
+    where
+        R: lsp_types::Request,
+        R::Params: Serialize,
+    {
         let id = self.req_id.get();
         self.req_id.set(id.wrapping_add(1));
 
@@ -364,7 +374,7 @@ impl Server {
         self.send_request_(r)
     }
     #[track_caller]
-    fn send_request_(&self, r: Request) -> Value {
+    fn send_request_(&self, r: Request) -> Result<Value, ResponseError> {
         let id = r.id.clone();
         self.client.sender.send(r.clone().into()).unwrap();
         while let Some(msg) = self.recv().unwrap_or_else(|Timeout| panic!("timeout: {r:?}")) {
@@ -386,9 +396,9 @@ impl Server {
                 Message::Response(res) => {
                     assert_eq!(res.id, id);
                     if let Some(err) = res.error {
-                        panic!("error response: {err:#?}");
+                        return Err(err);
                     }
-                    return res.result.unwrap();
+                    return Ok(res.result.unwrap());
                 }
             }
         }
@@ -498,6 +508,47 @@ impl Server {
             lsp_types::DidSaveTextDocumentParams {
                 text_document: self.doc_id(path),
                 text: Some(text),
+            },
+        )
+    }
+
+    pub(crate) fn write_watched_file(&self, path: &str, text: &str) {
+        fs::write(self.dir.path().join(path), text).unwrap();
+        self.notification::<lsp_types::DidChangeWatchedFilesNotification>(
+            lsp_types::DidChangeWatchedFilesParams::new(vec![lsp_types::FileEvent::new(
+                self.doc_id(path).uri,
+                lsp_types::FileChangeType::Changed,
+            )]),
+        )
+    }
+
+    pub(crate) fn open_file_with_text(&self, path: &str, text: String) {
+        fs::write(self.dir.path().join(path), &text).unwrap();
+        self.notification::<lsp_types::DidOpenTextDocumentNotification>(
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: self.doc_id(path).uri,
+                    language_id: lsp_types::LanguageKind::Rust,
+                    version: 1,
+                    text,
+                },
+            },
+        )
+    }
+
+    pub(crate) fn change_file_with_text(&self, path: &str, version: i32, text: String) {
+        fs::write(self.dir.path().join(path), &text).unwrap();
+        self.notification::<lsp_types::DidChangeTextDocumentNotification>(
+            lsp_types::DidChangeTextDocumentParams {
+                text_document: lsp_types::VersionedTextDocumentIdentifier {
+                    text_document_identifier: self.doc_id(path),
+                    version,
+                },
+                content_changes: vec![
+                    lsp_types::TextDocumentContentChangeEvent::TextDocumentContentChangeWholeDocument(
+                        lsp_types::TextDocumentContentChangeWholeDocument { text },
+                    ),
+                ],
             },
         )
     }

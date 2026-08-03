@@ -100,6 +100,7 @@ pub(crate) struct GlobalState {
     /// A mapping that maps a local source root's `SourceRootId` to it parent's `SourceRootId`, if it has one.
     pub(crate) local_roots_parent_map: Arc<FxHashMap<SourceRootId, SourceRootId>>,
     pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Uri, SemanticTokens>>>,
+    pub(crate) graph_snapshot_cache: Arc<Mutex<crate::graph_snapshot::GraphSnapshotCache>>,
 
     // status
     pub(crate) shutdown_requested: bool,
@@ -212,6 +213,8 @@ pub(crate) struct GlobalStateSnapshot {
     pub(crate) check_fixes: CheckFixes,
     mem_docs: MemDocs,
     pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Uri, SemanticTokens>>>,
+    pub(crate) graph_snapshot_cache: Arc<Mutex<crate::graph_snapshot::GraphSnapshotCache>>,
+    pub(crate) graph_snapshot_revision: u64,
     vfs: Arc<RwLock<(vfs::Vfs, FxHashMap<FileId, LineEndings>)>>,
     pub(crate) workspaces: Arc<Vec<ProjectWorkspace>>,
     // used to signal semantic highlighting to fall back to syntax based highlighting until
@@ -273,6 +276,7 @@ impl GlobalState {
             diagnostics: Default::default(),
             mem_docs: MemDocs::default(),
             semantic_tokens_cache: Arc::new(Default::default()),
+            graph_snapshot_cache: Arc::new(Default::default()),
             shutdown_requested: false,
             last_reported_status: lsp_ext::ServerStatusParams {
                 health: lsp_ext::Health::Ok,
@@ -389,6 +393,9 @@ impl GlobalState {
                             .unwrap_or_default();
 
                         let path = path.to_path_buf();
+                        let is_graph_project_input = self.workspaces.iter().any(|workspace| {
+                            workspace.graph_project_inputs.iter().any(|(input, _)| input == &path)
+                        });
                         if file.is_created_or_deleted() {
                             workspace_structure_change.get_or_insert((path, false)).1 |=
                                 self.crate_graph_file_dependencies.contains(vfs_path);
@@ -396,6 +403,7 @@ impl GlobalState {
                             &path,
                             file.kind(),
                             &additional_files,
+                            is_graph_project_input,
                         ) {
                             trace!(?path, kind = ?file.kind(), "refreshing for a change");
                             workspace_structure_change.get_or_insert((path.clone(), false));
@@ -440,6 +448,12 @@ impl GlobalState {
                 }
                 (change, modified_rust_files, workspace_structure_change)
             });
+
+        if workspace_structure_change.is_some() || modified_rust_files.is_empty() {
+            self.graph_snapshot_cache.lock().invalidate_all();
+        } else {
+            self.graph_snapshot_cache.lock().invalidate_files(&modified_rust_files);
+        }
 
         let cancellation_time = self.analysis_host.apply_change(change);
 
@@ -539,6 +553,7 @@ impl GlobalState {
             } else {
                 // No global or client level config was changed. So we can naively replace config.
                 self.config = Arc::new(config);
+                self.graph_snapshot_cache.lock().invalidate_all();
             }
         }
 
@@ -567,6 +582,7 @@ impl GlobalState {
     }
 
     pub(crate) fn snapshot(&self) -> GlobalStateSnapshot {
+        let graph_snapshot_revision = self.graph_snapshot_cache.lock().revision();
         GlobalStateSnapshot {
             config: Arc::clone(&self.config),
             workspaces: Arc::clone(&self.workspaces),
@@ -576,6 +592,8 @@ impl GlobalState {
             check_fixes: Arc::clone(&self.diagnostics.check_fixes),
             mem_docs: self.mem_docs.clone(),
             semantic_tokens_cache: Arc::clone(&self.semantic_tokens_cache),
+            graph_snapshot_cache: Arc::clone(&self.graph_snapshot_cache),
+            graph_snapshot_revision,
             proc_macros_loaded: !self.config.expand_proc_macros()
                 || self.fetch_proc_macros_queue.last_op_result().copied().unwrap_or(false),
             flycheck: self.flycheck.clone(),

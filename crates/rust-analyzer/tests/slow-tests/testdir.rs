@@ -76,6 +76,10 @@ impl TestDir {
     pub(crate) fn path(&self) -> &Utf8Path {
         &self.path
     }
+
+    pub(crate) fn shared(&self) -> TestDir {
+        TestDir { path: self.path.clone(), keep: true }
+    }
 }
 
 impl Drop for TestDir {

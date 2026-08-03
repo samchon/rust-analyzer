@@ -956,6 +956,7 @@ impl GlobalState {
                     ProcMacroProgress::Report(msg) => (Some(Progress::Report), Some(msg)),
                     ProcMacroProgress::End(change) => {
                         self.fetch_proc_macros_queue.op_completed(true);
+                        self.graph_snapshot_cache.lock().invalidate_all();
                         cancellation_time = Some(self.analysis_host.apply_change(change));
                         // FIXME This feels a bit off, this should go through similar machinery as build scripts?
                         _ = self.finish_loading_crate_graph();
@@ -1410,6 +1411,9 @@ impl GlobalState {
             // All other request handlers (lsp extension)
             .on::<RETRY, lsp_ext::FetchDependencyListRequest>(handlers::fetch_dependency_list)
             .on::<RETRY, lsp_ext::AnalyzerStatusRequest>(handlers::handle_analyzer_status)
+            .on_vfs_ready::<RETRY, lsp_ext::GraphSnapshotRequest>(
+                handlers::handle_graph_snapshot,
+            )
             .on::<RETRY, lsp_ext::ViewFileTextRequest>(handlers::handle_view_file_text)
             .on::<RETRY, lsp_ext::ViewCrateGraphRequest>(handlers::handle_view_crate_graph)
             .on::<RETRY, lsp_ext::ViewItemTreeRequest>(handlers::handle_view_item_tree)

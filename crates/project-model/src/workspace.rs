@@ -3,7 +3,12 @@
 //! database -- `CrateGraph`.
 
 use std::thread::Builder;
-use std::{collections::VecDeque, fmt, fs, iter, ops::Deref, sync, thread};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    env, fmt, fs, iter,
+    ops::Deref,
+    sync, thread,
+};
 
 use anyhow::Context;
 use base_db::{
@@ -16,6 +21,7 @@ use intern::{Symbol, sym};
 use paths::{AbsPath, AbsPathBuf, Utf8Path, Utf8PathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use semver::Version;
+use sha2::{Digest as _, Sha256};
 use span::{Edition, FileId};
 use toolchain::Tool;
 use tracing::instrument;
@@ -54,6 +60,15 @@ pub struct PackageRoot {
 #[derive(Clone)]
 pub struct ProjectWorkspace {
     pub kind: ProjectWorkspaceKind,
+    /// Cargo.lock bytes captured with the project model, never re-read by a
+    /// semantic snapshot after this workspace revision is published.
+    pub graph_lockfile: Option<Arc<[u8]>>,
+    /// Exact project/build input bytes captured with the project model. Missing
+    /// optional inputs are retained as `None`, so later creation also moves the
+    /// graph universe.
+    pub graph_project_inputs: Vec<(AbsPathBuf, Option<Arc<[u8]>>)>,
+    /// Exact rustc identity captured while the project model is loaded.
+    pub graph_rustc_version: Result<Arc<str>, Arc<str>>,
     /// The sysroot loaded for this workspace.
     pub sysroot: Sysroot,
     /// Holds cfg flags for the current target. We get those by running
@@ -113,6 +128,9 @@ impl fmt::Debug for ProjectWorkspace {
         // Make sure this isn't too verbose.
         let Self {
             kind,
+            graph_lockfile: _,
+            graph_project_inputs: _,
+            graph_rustc_version: _,
             sysroot,
             rustc_cfg,
             toolchain,
@@ -167,6 +185,10 @@ impl fmt::Debug for ProjectWorkspace {
                 .finish(),
         }
     }
+}
+
+fn graph_input(result: anyhow::Result<String>) -> Result<Arc<str>, Arc<str>> {
+    result.map(Arc::from).map_err(|error| Arc::from(error.to_string()))
 }
 
 impl ProjectWorkspace {
@@ -272,6 +294,13 @@ impl ProjectWorkspace {
         progress("querying project metadata".to_owned());
         let config_file =
             CargoConfigFile::load(cargo_toml, extra_env, &sysroot, config_path.as_deref());
+        let graph_cargo_config_inputs = cargo_config_input_paths(
+            workspace_dir,
+            config_path.as_deref(),
+            &[extra_args, metadata_extra_args],
+            extra_env,
+            config_file.as_ref(),
+        );
         let config_file_ = config_file.clone();
         let toolchain_config = QueryConfig::Cargo(&sysroot, cargo_toml, &config_file_);
         let targets =
@@ -452,6 +481,18 @@ impl ProjectWorkspace {
             _ = e.take();
         }
 
+        let graph_rustc_version =
+            graph_input(version::rustc_verbose(&sysroot, workspace_dir, extra_env));
+        let graph_project_inputs = capture_graph_project_inputs(
+            workspace_dir,
+            cargo
+                .packages()
+                .filter_map(|package| {
+                    let package = &cargo[package];
+                    package.is_member.then(|| AbsPathBuf::from(package.manifest.clone()))
+                })
+                .chain(graph_cargo_config_inputs),
+        );
         Ok(ProjectWorkspace {
             kind: ProjectWorkspaceKind::Cargo {
                 cargo,
@@ -459,6 +500,9 @@ impl ProjectWorkspace {
                 rustc,
                 error: error.map(Arc::new),
             },
+            graph_lockfile: fs::read(workspace_dir.join("Cargo.lock")).ok().map(Arc::from),
+            graph_project_inputs,
+            graph_rustc_version,
             sysroot,
             rustc_cfg,
             cfg_overrides: cfg_overrides.clone(),
@@ -530,8 +574,30 @@ impl ProjectWorkspace {
             sysroot.set_workspace(loaded_sysroot);
         }
 
+        let graph_rustc_version = graph_input(version::rustc_verbose(
+            &sysroot,
+            project_json.project_root(),
+            &config.extra_env,
+        ));
+        let graph_project_inputs = capture_graph_project_inputs(
+            project_json.project_root(),
+            project_json
+                .manifest()
+                .map(|manifest| AbsPathBuf::from(manifest.clone()))
+                .into_iter()
+                .chain(cargo_config_input_paths(
+                    project_json.project_root(),
+                    config.config_path.as_deref(),
+                    &[&config.extra_args, &config.metadata_extra_args],
+                    &config.extra_env,
+                    None,
+                )),
+        );
         ProjectWorkspace {
             kind: ProjectWorkspaceKind::Json(project_json),
+            graph_lockfile: None,
+            graph_project_inputs,
+            graph_rustc_version,
             sysroot,
             rustc_cfg,
             toolchain,
@@ -558,6 +624,13 @@ impl ProjectWorkspace {
             &config.extra_env,
             &sysroot,
             config.config_path.as_deref(),
+        );
+        let graph_cargo_config_inputs = cargo_config_input_paths(
+            dir,
+            config.config_path.as_deref(),
+            &[&config.extra_args, &config.metadata_extra_args],
+            &config.extra_env,
+            config_file.as_ref(),
         );
         let query_config = QueryConfig::Cargo(&sysroot, detached_file, &config_file);
         let toolchain = version::get(query_config, &config.extra_env).ok().flatten();
@@ -605,11 +678,17 @@ impl ProjectWorkspace {
             )
         });
 
+        let graph_rustc_version =
+            graph_input(version::rustc_verbose(&sysroot, dir, &config.extra_env));
+        let graph_project_inputs = capture_graph_project_inputs(dir, graph_cargo_config_inputs);
         Ok(ProjectWorkspace {
             kind: ProjectWorkspaceKind::DetachedFile {
                 file: detached_file.to_owned(),
                 cargo: cargo_script,
             },
+            graph_lockfile: fs::read(dir.join("Cargo.lock")).ok().map(Arc::from),
+            graph_project_inputs,
+            graph_rustc_version,
             sysroot,
             rustc_cfg,
             toolchain,
@@ -723,6 +802,46 @@ impl ProjectWorkspace {
         }
     }
 
+    /// Deterministic input for consumers that need to fence a serialized
+    /// semantic snapshot to this exact project-model universe.
+    pub fn graph_semantic_descriptor(&self) -> String {
+        let graph_project_inputs = self
+            .graph_project_inputs
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    path,
+                    bytes
+                        .as_deref()
+                        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+                        .unwrap_or_else(|| "missing".to_owned()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let common = (
+            graph_project_inputs,
+            &self.sysroot,
+            &self.rustc_cfg,
+            &self.toolchain,
+            &self.graph_rustc_version,
+            &self.target,
+            &self.cfg_overrides,
+            &self.extra_includes,
+            self.set_test,
+        );
+        match &self.kind {
+            ProjectWorkspaceKind::Cargo { cargo, error, build_scripts, rustc } => {
+                format!("Cargo({common:#?},{cargo:#?},{error:#?},{build_scripts:#?},{rustc:#?})")
+            }
+            ProjectWorkspaceKind::Json(project) => {
+                format!("Json({common:#?},{project:#?})")
+            }
+            ProjectWorkspaceKind::DetachedFile { file, cargo } => {
+                format!("DetachedFile({common:#?},{file:#?},{cargo:#?})")
+            }
+        }
+    }
+
     pub fn manifest(&self) -> Option<&ManifestPath> {
         match &self.kind {
             ProjectWorkspaceKind::Cargo { cargo, .. } => Some(cargo.manifest_path()),
@@ -734,14 +853,18 @@ impl ProjectWorkspace {
     }
 
     pub fn buildfiles(&self) -> Vec<AbsPathBuf> {
-        match &self.kind {
+        let mut files = match &self.kind {
             ProjectWorkspaceKind::Json(project) => project
                 .crates()
                 .filter_map(|(_, krate)| krate.build.as_ref().map(|build| build.build_file.clone()))
                 .map(|build_file| self.workspace_root().join(build_file))
                 .collect(),
             _ => vec![],
-        }
+        };
+        files.extend(self.graph_project_inputs.iter().map(|(path, _)| path.clone()));
+        files.sort();
+        files.dedup();
+        files
     }
 
     pub fn find_sysroot_proc_macro_srv(&self) -> Option<anyhow::Result<AbsPathBuf>> {
@@ -1027,13 +1150,23 @@ impl ProjectWorkspace {
 
     pub fn eq_ignore_build_data(&self, other: &Self) -> bool {
         let Self {
-            kind, sysroot, rustc_cfg, toolchain, target: target_layout, cfg_overrides, ..
+            kind,
+            sysroot,
+            rustc_cfg,
+            toolchain,
+            graph_rustc_version,
+            graph_project_inputs,
+            target: target_layout,
+            cfg_overrides,
+            ..
         } = self;
         let Self {
             kind: o_kind,
             sysroot: o_sysroot,
             rustc_cfg: o_rustc_cfg,
             toolchain: o_toolchain,
+            graph_rustc_version: o_graph_rustc_version,
+            graph_project_inputs: o_graph_project_inputs,
             target: o_target_layout,
             cfg_overrides: o_cfg_overrides,
             ..
@@ -1062,6 +1195,8 @@ impl ProjectWorkspace {
         }) && sysroot == o_sysroot
             && rustc_cfg == o_rustc_cfg
             && toolchain == o_toolchain
+            && graph_rustc_version == o_graph_rustc_version
+            && graph_project_inputs == o_graph_project_inputs
             && target_layout == o_target_layout
             && cfg_overrides == o_cfg_overrides
     }
@@ -1073,6 +1208,138 @@ impl ProjectWorkspace {
     pub fn is_json(&self) -> bool {
         matches!(self.kind, ProjectWorkspaceKind::Json { .. })
     }
+}
+
+fn capture_graph_project_inputs(
+    root: &AbsPath,
+    extra: impl IntoIterator<Item = AbsPathBuf>,
+) -> Vec<(AbsPathBuf, Option<Arc<[u8]>>)> {
+    let paths = ["Cargo.lock", "Cargo.toml", "rust-toolchain", "rust-toolchain.toml"]
+        .into_iter()
+        .map(|file| root.join(file))
+        .chain(extra)
+        .collect::<BTreeSet<_>>();
+    paths
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).ok().map(Arc::from);
+            (path, bytes)
+        })
+        .collect()
+}
+
+fn cargo_config_input_paths(
+    root: &AbsPath,
+    explicit: Option<&AbsPath>,
+    argument_groups: &[&[String]],
+    extra_env: &FxHashMap<String, Option<String>>,
+    discovered: Option<&CargoConfigFile>,
+) -> BTreeSet<AbsPathBuf> {
+    let mut paths = BTreeSet::new();
+    let mut ancestor = Some(root);
+    while let Some(current) = ancestor {
+        paths.insert(current.join(".cargo/config.toml"));
+        paths.insert(current.join(".cargo/config"));
+        ancestor = current.parent();
+    }
+    if let Some(explicit) = explicit {
+        paths.insert(explicit.to_path_buf());
+    }
+    for arguments in argument_groups {
+        let mut arguments = arguments.iter();
+        while let Some(argument) = arguments.next() {
+            let value = if argument == "--config" {
+                arguments.next().map(String::as_str)
+            } else {
+                argument.strip_prefix("--config=")
+            };
+            let Some(value) = value.filter(|value| !value.contains('=')) else { continue };
+            let path = Utf8Path::new(value);
+            paths.insert(if path.is_absolute() {
+                AbsPathBuf::try_from(path.to_path_buf())
+                    .expect("an absolute UTF-8 Cargo config path remains absolute")
+            } else {
+                root.join(path)
+            });
+        }
+    }
+    if let Some(discovered) = discovered {
+        paths.extend(
+            discovered
+                .graph_input_paths()
+                .into_iter()
+                .filter_map(|path| AbsPathBuf::try_from(path).ok()),
+        );
+    }
+
+    let configured_home = graph_environment_value(extra_env, "CARGO_HOME");
+    let cargo_home = configured_home
+        .map(Utf8PathBuf::from)
+        .and_then(|path| {
+            if path.is_absolute() { AbsPathBuf::try_from(path).ok() } else { Some(root.join(path)) }
+        })
+        .or_else(|| {
+            ["HOME", "USERPROFILE"].into_iter().find_map(|name| {
+                graph_environment_value(extra_env, name)
+                    .map(Utf8PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .and_then(|path| AbsPathBuf::try_from(path).ok())
+                    .map(|home| home.join(".cargo"))
+            })
+        });
+    if let Some(cargo_home) = cargo_home {
+        paths.insert(cargo_home.join("config.toml"));
+        paths.insert(cargo_home.join("config"));
+    }
+    paths
+}
+
+fn graph_environment_value(
+    extra_env: &FxHashMap<String, Option<String>>,
+    name: &str,
+) -> Option<String> {
+    match extra_env.iter().find(|(key, _)| {
+        if cfg!(windows) { key.eq_ignore_ascii_case(name) } else { key.as_str() == name }
+    }) {
+        Some((_, value)) => value.clone(),
+        None => env::var(name).ok(),
+    }
+}
+
+#[test]
+fn graph_cargo_config_inputs_cover_hierarchy_origins_explicit_and_missing_states() {
+    let directory = temp_dir::TempDir::new().unwrap();
+    let root = AbsPathBuf::assert_utf8(directory.path().to_path_buf());
+    let workspace = root.join("parent/workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let explicit = root.join("explicit/config.toml");
+    let origin = root.join("reported/.cargo/config.toml");
+    let cargo_home = root.join("cargo-home");
+    let mut extra_env = FxHashMap::default();
+    extra_env.insert("CARGO_HOME".to_owned(), Some(cargo_home.to_string()));
+    let discovered =
+        CargoConfigFile::from_string_for_test(format!("build.target = \"test\" # {origin}\n"));
+
+    let paths = cargo_config_input_paths(
+        workspace.as_ref(),
+        Some(explicit.as_ref()),
+        &[&[
+            "--config".to_owned(),
+            "argument/config.toml".to_owned(),
+            "--config=build.jobs=2".to_owned(),
+        ]],
+        &extra_env,
+        Some(&discovered),
+    );
+
+    assert!(paths.contains(&workspace.join(".cargo/config.toml")));
+    assert!(paths.contains(&root.join("parent/.cargo/config")));
+    assert!(paths.contains(&explicit));
+    assert!(paths.contains(&workspace.join("argument/config.toml")));
+    assert!(paths.contains(&origin));
+    assert!(paths.contains(&cargo_home.join("config.toml")));
+    let captured = capture_graph_project_inputs(workspace.as_ref(), paths);
+    assert!(captured.iter().any(|(path, bytes)| path == &explicit && bytes.is_none()));
 }
 
 #[instrument(skip_all)]
@@ -1108,6 +1375,7 @@ fn project_json_to_crate_graph(
             |(
                 idx,
                 Crate {
+                    root_module,
                     display_name,
                     edition,
                     version,
@@ -1195,6 +1463,16 @@ fn project_json_to_crate_graph(
                     },
                     crate_ws_data.clone(),
                 );
+                if !is_sysroot {
+                    crate_graph.set_graph_identity(
+                        crate_graph_crate_id,
+                        Arc::from(format!(
+                            "project-json={};crate-root={}",
+                            project.manifest_or_root(),
+                            root_module
+                        )),
+                    );
+                }
                 debug!(
                     ?crate_graph_crate_id,
                     crate = display_name.as_ref().map(|name| name.canonical_name().as_str()),
@@ -1499,6 +1777,10 @@ fn detached_file_to_crate_graph(
         Arc::new(detached_file.parent().to_path_buf()),
         crate_ws_data,
     );
+    crate_graph.set_graph_identity(
+        detached_file_crate,
+        Arc::from(format!("detached-file={detached_file}")),
+    );
 
     public_deps.add_to_crate_graph(&mut crate_graph, detached_file_crate);
     (crate_graph, FxHashMap::default())
@@ -1679,6 +1961,10 @@ fn add_target_crate_root(
         matches!(kind, TargetKind::Lib { is_proc_macro: true }),
         proc_macro_cwd,
         crate_ws_data,
+    );
+    crate_graph.set_graph_identity(
+        crate_id,
+        Arc::from(format!("cargo-package={};manifest={}", pkg.id, pkg.manifest)),
     );
     if let TargetKind::Lib { is_proc_macro: true } = kind {
         let proc_macro = match build_data {

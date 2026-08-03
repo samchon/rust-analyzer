@@ -85,13 +85,30 @@ impl GlobalState {
     /// Unlike `is_quiescent`, this returns false when we're indexing
     /// the project, because we're holding the salsa lock and cannot
     /// respond to LSP requests that depend on salsa data.
-    fn is_fully_ready(&self) -> bool {
+    pub(crate) fn is_fully_ready(&self) -> bool {
         self.is_quiescent() && !self.prime_caches_queue.op_in_progress()
+    }
+
+    /// Whether a graph export can observe a settled semantic universe.
+    pub(crate) fn is_graph_snapshot_ready(&self) -> bool {
+        self.is_fully_ready()
+            && !self.incomplete_crate_graph
+            && self.wants_to_switch.is_none()
+            && !self.fetch_workspaces_queue.op_requested()
+            && !self.fetch_build_data_queue.op_requested()
+            && !self.fetch_proc_macros_queue.op_requested()
+            && !self.prime_caches_queue.op_requested()
+            && !self.workspaces.is_empty()
+            && (!self.config.expand_proc_macros()
+                || self.fetch_proc_macros_queue.last_op_result().copied().unwrap_or(false))
+            && (!self.config.run_build_scripts(None)
+                || self.fetch_build_data_queue.last_op_result().is_some())
     }
 
     pub(crate) fn update_configuration(&mut self, config: Config) {
         let _p = tracing::info_span!("GlobalState::update_configuration").entered();
         let old_config = mem::replace(&mut self.config, Arc::new(config));
+        self.graph_snapshot_cache.lock().invalidate_all();
         if self.config.lru_parse_query_capacity() != old_config.lru_parse_query_capacity() {
             self.analysis_host.update_lru_capacity(self.config.lru_parse_query_capacity());
         }
@@ -514,6 +531,7 @@ impl GlobalState {
                     // Workspaces are the same, but we've updated build data.
                     info!("same workspace, but new build data");
                     self.workspaces = Arc::new(workspaces);
+                    self.graph_snapshot_cache.lock().invalidate_all();
                 } else {
                     info!("build scripts do not match the version of the active workspace");
                     if *force_crate_graph_reload {
@@ -539,6 +557,7 @@ impl GlobalState {
             // we don't care about build-script results, they are stale.
             // FIXME: can we abort the build scripts here if they are already running?
             self.workspaces = Arc::new(workspaces);
+            self.graph_snapshot_cache.lock().invalidate_all();
             self.check_workspaces_msrv().for_each(|message| {
                 self.send_notification::<lsp_types::ShowMessageNotification>(
                     lsp_types::ShowMessageParams { kind: lsp_types::MessageType::Warning, message },
@@ -807,6 +826,7 @@ impl GlobalState {
             }
 
             change.set_crate_graph(crate_graph);
+            self.graph_snapshot_cache.lock().invalidate_all();
             cancellation_time = Some(self.analysis_host.apply_change(change));
             _ = self.finish_loading_crate_graph();
         } else {
@@ -989,6 +1009,7 @@ pub(crate) fn should_refresh_for_change(
     path: &AbsPath,
     change_kind: ChangeKind,
     additional_paths: &[&str],
+    is_graph_project_input: bool,
 ) -> bool {
     // Note: build scripts are retriggered on file save, no refresh is necessary
     const IMPLICIT_TARGET_FILES: &[&str] = &["build.rs", "src/main.rs", "src/lib.rs"];
@@ -999,7 +1020,7 @@ pub(crate) fn should_refresh_for_change(
         None => return false,
     };
 
-    if let "Cargo.toml" | "Cargo.lock" = file_name {
+    if is_graph_project_input || matches!(file_name, "Cargo.toml" | "Cargo.lock") {
         return true;
     }
 
@@ -1058,4 +1079,20 @@ fn eq_ignore_underscore(s1: &str, s2: &str) -> bool {
 
         c1 == c2 || (c1_underscore && c2_underscore)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_refresh_for_change;
+    use vfs::{AbsPathBuf, ChangeKind};
+
+    #[test]
+    fn explicit_graph_project_inputs_refresh_outside_dot_cargo() {
+        let path = AbsPathBuf::assert_utf8(
+            std::env::current_dir().unwrap().join("custom/cargo-config.toml"),
+        );
+
+        assert!(!should_refresh_for_change(&path, ChangeKind::Modify, &[], false));
+        assert!(should_refresh_for_change(&path, ChangeKind::Modify, &[], true));
+    }
 }
