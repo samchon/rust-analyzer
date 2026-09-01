@@ -929,7 +929,7 @@ impl<'a> StaticIndex<'a> {
                     definition_body: nav.as_ref().map(|it| FileRange {
                         file_id: it.file_id,
                         range: if graph {
-                            graph_definition_body_range(def, scope_node, it.full_range)
+                            graph_definition_body_range(def, scope_node, range, it.full_range)
                         } else {
                             definition_range_excluding_trivia(&sema, it.file_id, it.full_range)
                         },
@@ -1175,17 +1175,14 @@ fn is_leading_trivia_excluding_docs(token: &SyntaxToken) -> bool {
 fn graph_definition_body_range(
     def: Definition<'_>,
     scope_node: &SyntaxNode,
+    binding: TextRange,
     fallback: TextRange,
 ) -> TextRange {
     let closure = matches!(def, Definition::Local(_))
         .then(|| scope_node.ancestors().find_map(ast::LetStmt::cast))
         .flatten()
         .and_then(|statement| {
-            closure_bound_to_range(
-                statement.pat()?,
-                statement.initializer()?,
-                scope_node.text_range(),
-            )
+            closure_bound_to_range(statement.pat()?, statement.initializer()?, binding)
         });
     closure.map(|closure| closure.syntax().text_range()).unwrap_or(fallback)
 }
@@ -1196,21 +1193,54 @@ fn closure_bound_to_range(
     binding: TextRange,
 ) -> Option<ast::ClosureExpr> {
     match (pattern, expression) {
-        (ast::Pat::IdentPat(pattern), ast::Expr::ClosureExpr(closure)) => {
-            pattern.syntax().text_range().contains_range(binding).then_some(closure)
-        }
+        (ast::Pat::IdentPat(pattern), ast::Expr::ClosureExpr(closure)) => pattern
+            .name()
+            .is_some_and(|name| name.syntax().text_range().contains_range(binding))
+            .then_some(closure),
         (ast::Pat::ParenPat(pattern), expression) => {
             closure_bound_to_range(pattern.pat()?, expression, binding)
         }
         (pattern, ast::Expr::ParenExpr(expression)) => {
             closure_bound_to_range(pattern, expression.expr()?, binding)
         }
-        (ast::Pat::TuplePat(pattern), ast::Expr::TupleExpr(expression)) => pattern
-            .fields()
-            .zip(expression.fields())
-            .find_map(|(pattern, expression)| closure_bound_to_range(pattern, expression, binding)),
+        (ast::Pat::TuplePat(pattern), ast::Expr::TupleExpr(expression)) => {
+            closure_bound_in_tuple(pattern, expression, binding)
+        }
         _ => None,
     }
+}
+
+fn closure_bound_in_tuple(
+    pattern: ast::TuplePat,
+    expression: ast::TupleExpr,
+    binding: TextRange,
+) -> Option<ast::ClosureExpr> {
+    let patterns = pattern.fields().collect::<Vec<_>>();
+    let expressions = expression.fields().collect::<Vec<_>>();
+    let rest = patterns.iter().position(|pattern| matches!(pattern, ast::Pat::RestPat(_)));
+    let Some(rest) = rest else {
+        if patterns.len() != expressions.len() {
+            return None;
+        }
+        return patterns.into_iter().zip(expressions).find_map(|(pattern, expression)| {
+            closure_bound_to_range(pattern, expression, binding)
+        });
+    };
+    let suffix = patterns.len() - rest - 1;
+    if expressions.len() < rest + suffix {
+        return None;
+    }
+    patterns[..rest]
+        .iter()
+        .cloned()
+        .zip(expressions[..rest].iter().cloned())
+        .chain(
+            patterns[rest + 1..]
+                .iter()
+                .cloned()
+                .zip(expressions[expressions.len() - suffix..].iter().cloned()),
+        )
+        .find_map(|(pattern, expression)| closure_bound_to_range(pattern, expression, binding))
 }
 
 fn is_trailing_trivia(token: &SyntaxToken) -> bool {
@@ -1966,6 +1996,13 @@ pub async fn asynchronous(value: Service<u8>) -> u8 {
     let constructed = Service(1);
     let closure = || Other::same(&value);
     let (nested,) = ((|arg: u8| Other::same(&value) + arg),);
+    let ref outer @ ref inner = || Parent::same(&value);
+    let (first, .., last) = (
+        || Parent::same(&value),
+        || 1,
+        || 2,
+        || Other::same(&value),
+    );
     invoke!(closure() + nested(1) + Child::child(&value) + constructed.inherent())
 }
 "#,
@@ -2028,5 +2065,20 @@ pub async fn asynchronous(value: Service<u8>) -> u8 {
             nested.definition_body.unwrap().range.len() > nested.definition.unwrap().range.len()
         );
         assert_eq!(argument.definition_body, argument.definition);
+        let local = |name: &str| {
+            tokens.iter().find(|token| token.display_name.as_deref() == Some(name)).unwrap()
+        };
+        let outer = local("outer");
+        let inner = local("inner");
+        let first = local("first");
+        let last = local("last");
+        assert!(outer.definition_body.unwrap().range.len() > outer.definition.unwrap().range.len());
+        assert!(
+            inner.definition_body.unwrap().range.len() < outer.definition_body.unwrap().range.len()
+        );
+        assert!(
+            first.definition_body.unwrap().range.start()
+                < last.definition_body.unwrap().range.start()
+        );
     }
 }
