@@ -42,6 +42,7 @@ use rust_analyzer::lsp::ext::{
     RunnablesRequest,
 };
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use stdx::format_to_acc;
 
 use test_utils::skip_slow_tests;
@@ -575,17 +576,14 @@ pub fn identity(attribute: TokenStream, item: TokenStream) -> TokenStream {
     );
 
     let healthy_source = std::fs::read_to_string(server.path().join("src/lib.rs")).unwrap();
-    let healthy_digest = snapshot
-        .upserts
-        .iter()
-        .find(|shard| shard.source.ends_with("src/lib.rs"))
-        .unwrap()
-        .checker_digest
-        .clone();
-    server.open_file_with_text(
-        "src/lib.rs",
-        healthy_source.replacen("#[decorate]", "#[decorate(fail)]", 1),
-    );
+    let healthy_digest = format!("{:x}", Sha256::digest(healthy_source.as_bytes()));
+    let healthy_shard =
+        snapshot.upserts.iter().find(|shard| shard.source.ends_with("src/lib.rs")).unwrap();
+    assert_eq!(healthy_shard.checker_digest, healthy_digest);
+    let healthy_shard_digest = healthy_shard.digest.clone();
+    let failed_source = healthy_source.replacen("#[decorate]", "#[decorate(fail)]", 1);
+    let failed_digest = format!("{:x}", Sha256::digest(failed_source.as_bytes()));
+    server.open_file_with_text("src/lib.rs", failed_source);
     let macro_failed = request_graph_snapshot(
         &server,
         GraphSnapshotParams {
@@ -600,7 +598,7 @@ pub fn identity(attribute: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .find(|shard| shard.source.ends_with("src/lib.rs"))
         .expect("proc-macro failure did not publish its changed source shard");
-    assert_ne!(failed_shard.checker_digest, healthy_digest);
+    assert_eq!(failed_shard.checker_digest, failed_digest);
     assert!(failed_shard.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "macro-error"
             && diagnostic.message.contains("fixture macro failure")
@@ -617,9 +615,15 @@ pub fn identity(attribute: TokenStream, item: TokenStream) -> TokenStream {
         "proc-macro recovery graph snapshot",
     );
     assert_eq!(macro_recovered.base_generation.as_deref(), Some(macro_failed.generation.as_str()));
-    assert!(macro_recovered.upserts.iter().all(|shard| {
-        shard.diagnostics.iter().all(|diagnostic| diagnostic.code != "macro-error")
-    }));
+    assert_eq!(macro_recovered.generation, snapshot.generation);
+    let recovered_shard = macro_recovered
+        .upserts
+        .iter()
+        .find(|shard| shard.source.ends_with("src/lib.rs"))
+        .expect("proc-macro recovery did not publish its restored source shard");
+    assert_eq!(recovered_shard.checker_digest, healthy_digest);
+    assert_eq!(recovered_shard.digest, healthy_shard_digest);
+    assert!(recovered_shard.diagnostics.iter().all(|diagnostic| diagnostic.code != "macro-error"));
 }
 
 fn request_graph_snapshot(
