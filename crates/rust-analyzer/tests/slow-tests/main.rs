@@ -447,11 +447,22 @@ pub fn identity(_attribute: TokenStream, item: TokenStream) -> TokenStream { ite
         .filter(|node| node.name == "same")
         .map(|node| node.id.as_str())
         .collect::<BTreeSet<_>>();
+    let unique_id = |name: &str| {
+        let ids = nodes
+            .iter()
+            .filter(|node| node.name == name)
+            .map(|node| node.id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 1, "expected one graph identity for {name}: {ids:?}");
+        *ids.first().unwrap()
+    };
 
     assert_unique_graph_node_ownership(&snapshot.upserts);
     assert_eq!(snapshot.producer.commit.len(), 40);
     assert!(snapshot.universe.configurations.iter().any(|row| row.contains("features=enabled")));
     assert!(snapshot.universe.configurations.iter().any(|row| row.contains("build_script_cfg")));
+    assert!(snapshot.universe.configurations.iter().any(|row| row == "proc-macros-loaded=true"));
+    assert!(snapshot.universe.configurations.iter().any(|row| row == "run-build-scripts=true"));
     assert!(snapshot.universe.configurations.iter().any(|row| row.starts_with("rustc-version=")));
     assert!(snapshot.universe.configurations.iter().any(|row| row.starts_with("target=")));
     assert!(names.is_superset(&BTreeSet::from([
@@ -490,10 +501,68 @@ pub fn identity(_attribute: TokenStream, item: TokenStream) -> TokenStream { ite
     ] {
         assert!(edge_kinds.contains(kind), "semantic breadth fixture omitted {kind}");
     }
+    assert!(edge_kinds.contains("contains"));
+    let asynchronous = unique_id("asynchronous");
+    let closure = unique_id("closure");
+    let generated = unique_id("generated");
+    let generated_test = unique_id("generated_is_tested");
+    let generic = unique_id("generic");
+    let identity = unique_id("identity");
+    let inherent = unique_id("inherent");
+    let proc_decorated = unique_id("proc_decorated");
+    let exported = unique_id("exported");
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "contains" && edge.from == asynchronous && edge.to == closure
+    }));
+    assert!(
+        edges.iter().any(|edge| {
+            edge.kind == "calls" && edge.from == asynchronous && edge.to == inherent
+        })
+    );
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "calls" && edge.from == closure && same_ids.contains(edge.to.as_str())
+    }));
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "calls" && edge.from == generic && same_ids.contains(edge.to.as_str())
+    }));
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "decorates" && edge.from == proc_decorated && edge.to == identity
+    }));
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "references" && edge.from == exported && edge.to == proc_decorated
+    }));
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "tests" && edge.from == generated_test && edge.to == generated
+    }));
     assert!(nodes.iter().filter(|node| node.name == "generated").all(|node| {
         node.evidence.as_ref().is_some_and(|evidence| evidence.file == "src/lib.rs")
     }));
-    assert!(snapshot.upserts.iter().all(|shard| shard.coverage.len() == 15));
+    let expected_coverage = BTreeMap::from([
+        ("accesses", "partial"),
+        ("calls", "partial"),
+        ("contains", "partial"),
+        ("decorates", "partial"),
+        ("dispatches", "partial"),
+        ("exports", "partial"),
+        ("extends", "partial"),
+        ("implements", "partial"),
+        ("imports", "partial"),
+        ("instantiates", "partial"),
+        ("overrides", "partial"),
+        ("references", "partial"),
+        ("renders", "unsupported"),
+        ("tests", "partial"),
+        ("type_ref", "partial"),
+    ]);
+    assert!(snapshot.upserts.iter().all(|shard| {
+        shard.coverage.len() == expected_coverage.len()
+            && shard
+                .coverage
+                .iter()
+                .map(|row| (row.family.as_str(), row.state.as_str()))
+                .collect::<BTreeMap<_, _>>()
+                == expected_coverage
+    }));
     assert!(
         snapshot
             .upserts

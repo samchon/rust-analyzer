@@ -1941,6 +1941,13 @@ pub async fn asynchronous(value: Service<u8>) -> u8 {
             .iter()
             .flat_map(|token| token.references.iter().map(|reference| reference.role))
             .collect::<Vec<_>>();
+        let roles_for = |name: &str| {
+            tokens
+                .iter()
+                .filter(|token| token.display_name.as_deref() == Some(name))
+                .flat_map(|token| token.references.iter().map(|reference| reference.role))
+                .collect::<Vec<_>>()
+        };
 
         assert!(relation_kinds.contains(&StaticRelationKind::Extends));
         assert!(relation_kinds.contains(&StaticRelationKind::Implements));
@@ -1959,5 +1966,8 @@ pub async fn asynchronous(value: Service<u8>) -> u8 {
         assert!(roles.contains(&StaticReferenceRole::Call));
         assert!(roles.contains(&StaticReferenceRole::Instantiate));
         assert!(roles.contains(&StaticReferenceRole::Type));
+        assert!(roles_for("Service").contains(&StaticReferenceRole::Instantiate));
+        assert!(roles_for("inherent").contains(&StaticReferenceRole::Call));
+        assert!(roles_for("same").contains(&StaticReferenceRole::Call));
     }
 }
