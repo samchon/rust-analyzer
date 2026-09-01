@@ -928,7 +928,11 @@ impl<'a> StaticIndex<'a> {
                     }),
                     definition_body: nav.as_ref().map(|it| FileRange {
                         file_id: it.file_id,
-                        range: definition_range_excluding_trivia(&sema, it.file_id, it.full_range),
+                        range: if graph {
+                            graph_definition_body_range(def, scope_node, it.full_range)
+                        } else {
+                            definition_range_excluding_trivia(&sema, it.file_id, it.full_range)
+                        },
                     }),
                     references: vec![],
                     moniker,
@@ -1165,6 +1169,21 @@ fn is_leading_trivia_excluding_docs(token: &SyntaxToken) -> bool {
         SyntaxKind::WHITESPACE => true,
         SyntaxKind::COMMENT => ast::Comment::cast(token.clone()).is_none_or(|it| !it.is_outer()),
         _ => false,
+    }
+}
+
+fn graph_definition_body_range(
+    def: Definition<'_>,
+    scope_node: &SyntaxNode,
+    fallback: TextRange,
+) -> TextRange {
+    if matches!(def, Definition::Local(_))
+        && let Some(statement) = scope_node.ancestors().find_map(ast::LetStmt::cast)
+        && let Some(ast::Expr::ClosureExpr(closure)) = statement.initializer()
+    {
+        closure.syntax().text_range()
+    } else {
+        fallback
     }
 }
 
@@ -1969,5 +1988,10 @@ pub async fn asynchronous(value: Service<u8>) -> u8 {
         assert!(roles_for("Service").contains(&StaticReferenceRole::Instantiate));
         assert!(roles_for("inherent").contains(&StaticReferenceRole::Call));
         assert!(roles_for("same").contains(&StaticReferenceRole::Call));
+        let closure =
+            tokens.iter().find(|token| token.display_name.as_deref() == Some("closure")).unwrap();
+        assert!(
+            closure.definition_body.unwrap().range.len() > closure.definition.unwrap().range.len()
+        );
     }
 }
