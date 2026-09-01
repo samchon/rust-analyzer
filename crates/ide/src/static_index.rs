@@ -1177,13 +1177,39 @@ fn graph_definition_body_range(
     scope_node: &SyntaxNode,
     fallback: TextRange,
 ) -> TextRange {
-    if matches!(def, Definition::Local(_))
-        && let Some(statement) = scope_node.ancestors().find_map(ast::LetStmt::cast)
-        && let Some(ast::Expr::ClosureExpr(closure)) = statement.initializer()
-    {
-        closure.syntax().text_range()
-    } else {
-        fallback
+    let closure = matches!(def, Definition::Local(_))
+        .then(|| scope_node.ancestors().find_map(ast::LetStmt::cast))
+        .flatten()
+        .and_then(|statement| {
+            closure_bound_to_range(
+                statement.pat()?,
+                statement.initializer()?,
+                scope_node.text_range(),
+            )
+        });
+    closure.map(|closure| closure.syntax().text_range()).unwrap_or(fallback)
+}
+
+fn closure_bound_to_range(
+    pattern: ast::Pat,
+    expression: ast::Expr,
+    binding: TextRange,
+) -> Option<ast::ClosureExpr> {
+    match (pattern, expression) {
+        (ast::Pat::IdentPat(pattern), ast::Expr::ClosureExpr(closure)) => {
+            pattern.syntax().text_range().contains_range(binding).then_some(closure)
+        }
+        (ast::Pat::ParenPat(pattern), expression) => {
+            closure_bound_to_range(pattern.pat()?, expression, binding)
+        }
+        (pattern, ast::Expr::ParenExpr(expression)) => {
+            closure_bound_to_range(pattern, expression.expr()?, binding)
+        }
+        (ast::Pat::TuplePat(pattern), ast::Expr::TupleExpr(expression)) => pattern
+            .fields()
+            .zip(expression.fields())
+            .find_map(|(pattern, expression)| closure_bound_to_range(pattern, expression, binding)),
+        _ => None,
     }
 }
 
@@ -1939,7 +1965,8 @@ pub fn generic<T: Parent>(value: &T) -> u8 { value.same() }
 pub async fn asynchronous(value: Service<u8>) -> u8 {
     let constructed = Service(1);
     let closure = || Other::same(&value);
-    invoke!(closure() + Child::child(&value) + constructed.inherent())
+    let (nested,) = ((|arg: u8| Other::same(&value) + arg),);
+    invoke!(closure() + nested(1) + Child::child(&value) + constructed.inherent())
 }
 "#,
         );
@@ -1993,5 +2020,13 @@ pub async fn asynchronous(value: Service<u8>) -> u8 {
         assert!(
             closure.definition_body.unwrap().range.len() > closure.definition.unwrap().range.len()
         );
+        let nested =
+            tokens.iter().find(|token| token.display_name.as_deref() == Some("nested")).unwrap();
+        let argument =
+            tokens.iter().find(|token| token.display_name.as_deref() == Some("arg")).unwrap();
+        assert!(
+            nested.definition_body.unwrap().range.len() > nested.definition.unwrap().range.len()
+        );
+        assert_eq!(argument.definition_body, argument.definition);
     }
 }
