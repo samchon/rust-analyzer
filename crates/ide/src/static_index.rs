@@ -1193,6 +1193,9 @@ fn closure_bound_to_range(
     binding: TextRange,
 ) -> Option<ast::ClosureExpr> {
     match (pattern, expression) {
+        (pattern, ast::Expr::ParenExpr(expression)) => {
+            closure_bound_to_range(pattern, expression.expr()?, binding)
+        }
         (ast::Pat::IdentPat(pattern), expression) => match expression {
             ast::Expr::ClosureExpr(closure) => pattern
                 .name()
@@ -1202,9 +1205,6 @@ fn closure_bound_to_range(
         },
         (ast::Pat::ParenPat(pattern), expression) => {
             closure_bound_to_range(pattern.pat()?, expression, binding)
-        }
-        (pattern, ast::Expr::ParenExpr(expression)) => {
-            closure_bound_to_range(pattern, expression.expr()?, binding)
         }
         (ast::Pat::TuplePat(pattern), ast::Expr::TupleExpr(expression)) => {
             closure_bound_in_tuple(pattern, expression, binding)
@@ -2108,10 +2108,7 @@ pub async fn asynchronous(value: Service<u8>) -> u8 {
             wrapped_last.definition_body.unwrap().range.len()
                 > wrapped_last.definition.unwrap().range.len()
         );
-        assert!(
-            wrapper.definition_body.unwrap().range.len()
-                < wrapped_first.definition_body.unwrap().range.len()
-        );
+        assert_eq!(wrapper.definition_body, wrapper.definition);
         assert!(
             parenthesized.definition_body.unwrap().range.len()
                 > parenthesized.definition.unwrap().range.len()
