@@ -20,7 +20,11 @@ mod ratoml;
 mod support;
 mod testdir;
 
-use std::{collections::BTreeMap, path::PathBuf, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    time::Instant,
+};
 
 use ide_db::FxHashMap;
 use lsp_types::{
@@ -320,6 +324,172 @@ pub trait Shared {}
     assert_ne!(dependency_changed.universe.digest, config_recovered.universe.digest);
     assert_eq!(dependency_changed.base_generation, None);
     assert!(!dependency_changed.upserts.is_empty());
+}
+
+#[test]
+fn graph_snapshot_covers_semantic_breadth_and_build_universe() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    const FIXTURE: &str = r#"
+//- /Cargo.toml
+[workspace]
+members = ["fixture-macro"]
+resolver = "2"
+
+[package]
+name = "graph-breadth"
+version = "0.0.0"
+edition = "2024"
+build = "build.rs"
+
+[features]
+default = ["enabled"]
+enabled = []
+
+[dependencies]
+fixture-macro = { path = "fixture-macro" }
+
+//- /build.rs
+fn main() {
+    let out = std::env::var_os("OUT_DIR").unwrap();
+    std::fs::write(
+        std::path::Path::new(&out).join("generated.rs"),
+        "pub fn generated() -> u8 { 7 }\n",
+    )
+    .unwrap();
+    println!("cargo::rustc-cfg=build_script_cfg");
+    println!("cargo::rerun-if-changed=build.rs");
+}
+
+//- /src/lib.rs
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+pub trait Parent { type Item; const VALUE: u8; fn same(&self) -> u8; }
+pub trait Child: Parent { fn child(&self) -> u8; }
+pub trait Other { fn same(&self) -> u8; }
+pub struct Service<T>(pub T);
+impl Service<u8> { pub fn inherent(&self) -> u8 { self.0 } }
+impl Parent for Service<u8> {
+    type Item = u8;
+    const VALUE: u8 = 1;
+    fn same(&self) -> u8 { self.0 }
+}
+impl Child for Service<u8> { fn child(&self) -> u8 { Parent::same(self) } }
+impl Other for Service<u8> { fn same(&self) -> u8 { self.inherent() } }
+
+macro_rules! invoke { ($value:expr) => { $value }; }
+
+#[fixture_macro::identity]
+pub fn proc_decorated() -> u8 { generated() }
+
+#[cfg(feature = "enabled")]
+pub fn featured() -> u8 { 1 }
+
+#[cfg(build_script_cfg)]
+pub fn built() -> u8 { 2 }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn targeted() -> u8 { 3 }
+
+pub use proc_decorated as exported;
+
+pub fn generic<T: Parent>(value: &T) -> u8 { value.same() }
+
+pub async fn asynchronous(value: Service<u8>) -> u8 {
+    let constructed = Service(1);
+    let closure = || Other::same(&value);
+    invoke!(closure() + Child::child(&value) + constructed.inherent() + exported())
+}
+
+#[test]
+fn generated_is_tested() { assert_eq!(generated(), 7); }
+
+//- /fixture-macro/Cargo.toml
+[package]
+name = "fixture-macro"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+//- /fixture-macro/src/lib.rs
+use proc_macro::TokenStream;
+
+#[proc_macro_attribute]
+pub fn identity(_attribute: TokenStream, item: TokenStream) -> TokenStream { item }
+"#;
+    let server = project(FIXTURE).server().wait_until_workspace_is_loaded();
+    let snapshot = request_graph_snapshot(
+        &server,
+        GraphSnapshotParams::default(),
+        "semantic breadth graph snapshot",
+    );
+    let nodes = snapshot.upserts.iter().flat_map(|shard| &shard.nodes).collect::<Vec<_>>();
+    let edges = snapshot.upserts.iter().flat_map(|shard| &shard.edges).collect::<Vec<_>>();
+    let edge_kinds = edges.iter().map(|edge| edge.kind.as_str()).collect::<BTreeSet<_>>();
+    let names = nodes.iter().map(|node| node.name.as_str()).collect::<BTreeSet<_>>();
+    let same_ids = nodes
+        .iter()
+        .filter(|node| node.name == "same")
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+
+    assert_unique_graph_node_ownership(&snapshot.upserts);
+    assert_eq!(snapshot.producer.commit.len(), 40);
+    assert!(snapshot.universe.configurations.iter().any(|row| row.contains("features=enabled")));
+    assert!(snapshot.universe.configurations.iter().any(|row| row.contains("build_script_cfg")));
+    assert!(snapshot.universe.configurations.iter().any(|row| row.starts_with("rustc-version=")));
+    assert!(snapshot.universe.configurations.iter().any(|row| row.starts_with("target=")));
+    assert!(names.is_superset(&BTreeSet::from([
+        "Child",
+        "Item",
+        "Other",
+        "Parent",
+        "Service",
+        "VALUE",
+        "asynchronous",
+        "built",
+        "closure",
+        "exported",
+        "featured",
+        "generated",
+        "generic",
+        "identity",
+        "inherent",
+        "proc_decorated",
+        "targeted",
+    ])));
+    assert!(same_ids.len() >= 4, "same-named trait and impl methods were conflated");
+    for kind in [
+        "accesses",
+        "calls",
+        "decorates",
+        "exports",
+        "extends",
+        "implements",
+        "imports",
+        "instantiates",
+        "overrides",
+        "references",
+        "tests",
+        "type_ref",
+    ] {
+        assert!(edge_kinds.contains(kind), "semantic breadth fixture omitted {kind}");
+    }
+    assert!(nodes.iter().filter(|node| node.name == "generated").all(|node| {
+        node.evidence.as_ref().is_some_and(|evidence| evidence.file == "src/lib.rs")
+    }));
+    assert!(snapshot.upserts.iter().all(|shard| shard.coverage.len() == 15));
+    assert!(
+        snapshot
+            .upserts
+            .iter()
+            .flat_map(|shard| &shard.unresolved)
+            .any(|row| { row.family == "dispatches" && row.reason == "dynamic" })
+    );
 }
 
 fn request_graph_snapshot(

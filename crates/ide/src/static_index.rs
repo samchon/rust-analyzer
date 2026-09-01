@@ -1896,4 +1896,68 @@ pub fn run() { invoke!(Service.render()); }
         assert!(service_is_constructed);
         assert!(render_is_called);
     }
+
+    #[test]
+    fn graph_covers_trait_generic_async_and_macro_semantics() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- minicore: async_fn
+//- /workspace/lib.rs crate:main
+pub trait Parent { type Item; const VALUE: u8; fn same(&self) -> u8; }
+pub trait Child: Parent { fn child(&self) -> u8; }
+pub trait Other { fn same(&self) -> u8; }
+pub struct Service<T>(pub T);
+impl Service<u8> { pub fn inherent(&self) -> u8 { self.0 } }
+impl Parent for Service<u8> {
+    type Item = u8;
+    const VALUE: u8 = 1;
+    fn same(&self) -> u8 { self.0 }
+}
+impl Child for Service<u8> { fn child(&self) -> u8 { Parent::same(self) } }
+impl Other for Service<u8> { fn same(&self) -> u8 { self.inherent() } }
+macro_rules! invoke { ($value:expr) => { $value }; }
+pub fn generic<T: Parent>(value: &T) -> u8 { value.same() }
+pub async fn asynchronous(value: Service<u8>) -> u8 {
+    let constructed = Service(1);
+    let closure = || Other::same(&value);
+    invoke!(closure() + Child::child(&value) + constructed.inherent())
+}
+"#,
+        );
+        let index = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded);
+        let relation_kinds =
+            index.relations.iter().map(|relation| relation.kind).collect::<BTreeSet<_>>();
+        let tokens = index.tokens.iter().map(|(_, token)| token).collect::<Vec<_>>();
+        let same_ids = tokens
+            .iter()
+            .filter(|token| token.display_name.as_deref() == Some("same"))
+            .map(|token| token.stable_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let names = tokens
+            .iter()
+            .filter_map(|token| token.display_name.as_deref())
+            .collect::<BTreeSet<_>>();
+        let roles = tokens
+            .iter()
+            .flat_map(|token| token.references.iter().map(|reference| reference.role))
+            .collect::<Vec<_>>();
+
+        assert!(relation_kinds.contains(&StaticRelationKind::Extends));
+        assert!(relation_kinds.contains(&StaticRelationKind::Implements));
+        assert!(relation_kinds.contains(&StaticRelationKind::Overrides));
+        assert!(same_ids.len() >= 4, "same-named trait and impl methods were conflated");
+        assert!(names.is_superset(&BTreeSet::from([
+            "Item",
+            "VALUE",
+            "asynchronous",
+            "child",
+            "closure",
+            "generic",
+            "inherent",
+        ])));
+        assert!(roles.contains(&StaticReferenceRole::Access));
+        assert!(roles.contains(&StaticReferenceRole::Call));
+        assert!(roles.contains(&StaticReferenceRole::Instantiate));
+        assert!(roles.contains(&StaticReferenceRole::Type));
+    }
 }
