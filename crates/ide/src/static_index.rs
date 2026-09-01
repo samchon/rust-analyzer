@@ -1193,10 +1193,13 @@ fn closure_bound_to_range(
     binding: TextRange,
 ) -> Option<ast::ClosureExpr> {
     match (pattern, expression) {
-        (ast::Pat::IdentPat(pattern), ast::Expr::ClosureExpr(closure)) => pattern
-            .name()
-            .is_some_and(|name| name.syntax().text_range().contains_range(binding))
-            .then_some(closure),
+        (ast::Pat::IdentPat(pattern), expression) => match expression {
+            ast::Expr::ClosureExpr(closure) => pattern
+                .name()
+                .is_some_and(|name| name.syntax().text_range().contains_range(binding))
+                .then_some(closure),
+            expression => closure_bound_to_range(pattern.pat()?, expression, binding),
+        },
         (ast::Pat::ParenPat(pattern), expression) => {
             closure_bound_to_range(pattern.pat()?, expression, binding)
         }
@@ -2003,6 +2006,9 @@ pub async fn asynchronous(value: Service<u8>) -> u8 {
         || 2,
         || Other::same(&value),
     );
+    let wrapper @ (wrapped_first, wrapped_last) =
+        (|| Parent::same(&value), || Other::same(&value));
+    let (parenthesized) = (|| Other::same(&value));
     invoke!(closure() + nested(1) + Child::child(&value) + constructed.inherent())
 }
 "#,
@@ -2072,6 +2078,10 @@ pub async fn asynchronous(value: Service<u8>) -> u8 {
         let inner = local("inner");
         let first = local("first");
         let last = local("last");
+        let wrapped_first = local("wrapped_first");
+        let wrapped_last = local("wrapped_last");
+        let wrapper = local("wrapper");
+        let parenthesized = local("parenthesized");
         assert!(outer.definition_body.unwrap().range.len() > outer.definition.unwrap().range.len());
         assert!(
             inner.definition_body.unwrap().range.len() < outer.definition_body.unwrap().range.len()
@@ -2079,6 +2089,32 @@ pub async fn asynchronous(value: Service<u8>) -> u8 {
         assert!(
             first.definition_body.unwrap().range.start()
                 < last.definition_body.unwrap().range.start()
+        );
+        let last_body = last.definition_body.unwrap();
+        let last_owns_same = tokens
+            .iter()
+            .filter(|token| token.display_name.as_deref() == Some("same"))
+            .flat_map(|token| &token.references)
+            .any(|reference| {
+                reference.range.file_id == last_body.file_id
+                    && last_body.range.contains_range(reference.range.range)
+            });
+        assert!(last_owns_same);
+        assert!(
+            wrapped_first.definition_body.unwrap().range.len()
+                > wrapped_first.definition.unwrap().range.len()
+        );
+        assert!(
+            wrapped_last.definition_body.unwrap().range.len()
+                > wrapped_last.definition.unwrap().range.len()
+        );
+        assert!(
+            wrapper.definition_body.unwrap().range.len()
+                < wrapped_first.definition_body.unwrap().range.len()
+        );
+        assert!(
+            parenthesized.definition_body.unwrap().range.len()
+                > parenthesized.definition.unwrap().range.len()
         );
     }
 }
