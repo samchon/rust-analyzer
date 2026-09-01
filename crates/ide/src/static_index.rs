@@ -1256,7 +1256,7 @@ mod tests {
 
     use crate::{StaticIndex, fixture};
     use ide_db::{FileRange, FxHashMap, FxHashSet, base_db::VfsPath};
-    use syntax::TextSize;
+    use syntax::{AstNode, TextSize, ast};
 
     use super::{StaticReferenceRole, StaticRelationKind, VendoredLibrariesConfig};
 
@@ -2108,7 +2108,16 @@ pub async fn asynchronous(value: Service<u8>) -> u8 {
             wrapped_last.definition_body.unwrap().range.len()
                 > wrapped_last.definition.unwrap().range.len()
         );
-        assert_eq!(wrapper.definition_body, wrapper.definition);
+        let wrapper_body = wrapper.definition_body.unwrap();
+        let wrapper_pattern = analysis
+            .parse(wrapper_body.file_id)
+            .unwrap()
+            .syntax()
+            .descendants()
+            .filter_map(ast::IdentPat::cast)
+            .find(|pattern| pattern.syntax().text().to_string().starts_with("wrapper @"))
+            .unwrap();
+        assert_eq!(wrapper_body.range, wrapper_pattern.syntax().text_range());
         assert!(
             parenthesized.definition_body.unwrap().range.len()
                 > parenthesized.definition.unwrap().range.len()
