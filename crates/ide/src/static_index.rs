@@ -1180,7 +1180,7 @@ mod tests {
     use ide_db::{FileRange, FxHashMap, FxHashSet, base_db::VfsPath};
     use syntax::TextSize;
 
-    use super::{StaticRelationKind, VendoredLibrariesConfig};
+    use super::{StaticReferenceRole, StaticRelationKind, VendoredLibrariesConfig};
 
     fn graph_identities(ra_fixture: &str) -> Vec<(Option<String>, String)> {
         let (analysis, _) = fixture::annotations_without_marker(ra_fixture);

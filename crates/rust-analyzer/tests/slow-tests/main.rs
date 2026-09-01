@@ -381,7 +381,9 @@ impl Other for Service<u8> { fn same(&self) -> u8 { self.inherent() } }
 
 macro_rules! invoke { ($value:expr) => { $value }; }
 
-#[fixture_macro::identity]
+use fixture_macro::identity as decorate;
+
+#[decorate]
 pub fn proc_decorated() -> u8 { generated() }
 
 #[cfg(feature = "enabled")]
@@ -421,7 +423,16 @@ use proc_macro::TokenStream;
 #[proc_macro_attribute]
 pub fn identity(_attribute: TokenStream, item: TokenStream) -> TokenStream { item }
 "#;
-    let server = project(FIXTURE).server().wait_until_workspace_is_loaded();
+    let server = Project::with_fixture(FIXTURE)
+        .with_config(json!({
+            "cargo": {
+                "buildScripts": { "enable": true },
+                "sysroot": "discover",
+            },
+            "procMacro": { "enable": true },
+        }))
+        .server()
+        .wait_until_workspace_is_loaded();
     let snapshot = request_graph_snapshot(
         &server,
         GraphSnapshotParams::default(),
