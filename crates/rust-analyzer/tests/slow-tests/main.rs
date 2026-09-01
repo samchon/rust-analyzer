@@ -421,7 +421,10 @@ proc-macro = true
 use proc_macro::TokenStream;
 
 #[proc_macro_attribute]
-pub fn identity(_attribute: TokenStream, item: TokenStream) -> TokenStream { item }
+pub fn identity(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    if attribute.to_string() == "fail" { panic!("fixture macro failure"); }
+    item
+}
 "#;
     let server = Project::with_fixture(FIXTURE)
         .with_config(json!({
@@ -570,6 +573,53 @@ pub fn identity(_attribute: TokenStream, item: TokenStream) -> TokenStream { ite
             .flat_map(|shard| &shard.unresolved)
             .any(|row| { row.family == "dispatches" && row.reason == "dynamic" })
     );
+
+    let healthy_source = std::fs::read_to_string(server.path().join("src/lib.rs")).unwrap();
+    let healthy_digest = snapshot
+        .upserts
+        .iter()
+        .find(|shard| shard.source.ends_with("src/lib.rs"))
+        .unwrap()
+        .checker_digest
+        .clone();
+    server.open_file_with_text(
+        "src/lib.rs",
+        healthy_source.replacen("#[decorate]", "#[decorate(fail)]", 1),
+    );
+    let macro_failed = request_graph_snapshot(
+        &server,
+        GraphSnapshotParams {
+            known_generation: Some(snapshot.generation.clone()),
+            checkpoint: None,
+        },
+        "proc-macro failure graph snapshot",
+    );
+    assert_eq!(macro_failed.base_generation.as_deref(), Some(snapshot.generation.as_str()));
+    let failed_shard = macro_failed
+        .upserts
+        .iter()
+        .find(|shard| shard.source.ends_with("src/lib.rs"))
+        .expect("proc-macro failure did not publish its changed source shard");
+    assert_ne!(failed_shard.checker_digest, healthy_digest);
+    assert!(failed_shard.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "macro-error"
+            && diagnostic.message.contains("fixture macro failure")
+            && diagnostic.severity.as_deref() == Some("error")
+    }));
+
+    server.change_file_with_text("src/lib.rs", 2, healthy_source);
+    let macro_recovered = request_graph_snapshot(
+        &server,
+        GraphSnapshotParams {
+            known_generation: Some(macro_failed.generation.clone()),
+            checkpoint: None,
+        },
+        "proc-macro recovery graph snapshot",
+    );
+    assert_eq!(macro_recovered.base_generation.as_deref(), Some(macro_failed.generation.as_str()));
+    assert!(macro_recovered.upserts.iter().all(|shard| {
+        shard.diagnostics.iter().all(|diagnostic| diagnostic.code != "macro-error")
+    }));
 }
 
 fn request_graph_snapshot(
