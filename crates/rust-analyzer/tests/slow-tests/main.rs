@@ -577,8 +577,7 @@ pub fn identity(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
     let healthy_source = std::fs::read_to_string(server.path().join("src/lib.rs")).unwrap();
     let healthy_digest = format!("{:x}", Sha256::digest(healthy_source.as_bytes()));
-    let healthy_shard =
-        snapshot.upserts.iter().find(|shard| shard.source.ends_with("src/lib.rs")).unwrap();
+    let healthy_shard = snapshot.upserts.iter().find(|shard| shard.source == "src/lib.rs").unwrap();
     assert_eq!(healthy_shard.checker_digest, healthy_digest);
     let healthy_shard_digest = healthy_shard.digest.clone();
     let failed_source = healthy_source.replacen("#[decorate]", "#[decorate(fail)]", 1);
@@ -596,7 +595,7 @@ pub fn identity(attribute: TokenStream, item: TokenStream) -> TokenStream {
     let failed_shard = macro_failed
         .upserts
         .iter()
-        .find(|shard| shard.source.ends_with("src/lib.rs"))
+        .find(|shard| shard.source == "src/lib.rs")
         .expect("proc-macro failure did not publish its changed source shard");
     assert_eq!(failed_shard.checker_digest, failed_digest);
     assert!(failed_shard.diagnostics.iter().any(|diagnostic| {
@@ -619,7 +618,7 @@ pub fn identity(attribute: TokenStream, item: TokenStream) -> TokenStream {
     let recovered_shard = macro_recovered
         .upserts
         .iter()
-        .find(|shard| shard.source.ends_with("src/lib.rs"))
+        .find(|shard| shard.source == "src/lib.rs")
         .expect("proc-macro recovery did not publish its restored source shard");
     assert_eq!(recovered_shard.checker_digest, healthy_digest);
     assert_eq!(recovered_shard.digest, healthy_shard_digest);
