@@ -866,7 +866,8 @@ impl ProjectWorkspace {
                 cargo: Some((cargo, build_scripts, _)),
                 ..
             } => extend(cargo, build_scripts),
-            ProjectWorkspaceKind::Json(_) | ProjectWorkspaceKind::DetachedFile { cargo: None, .. } => {}
+            ProjectWorkspaceKind::Json(_)
+            | ProjectWorkspaceKind::DetachedFile { cargo: None, .. } => {}
         }
         configurations.sort();
         configurations.dedup();
