@@ -2060,7 +2060,13 @@ fn build_shards(
             let owner = if reference.role == StaticReferenceRole::Export {
                 file_nodes.get(&reference.range.file_id).cloned().unwrap()
             } else {
-                enclosing_owner(&definitions, reference.range)
+                let attribute_owner = if reference.role == StaticReferenceRole::Decorate {
+                    decorated_owner(snap, &definitions, reference.range)?
+                } else {
+                    None
+                };
+                attribute_owner
+                    .or_else(|| enclosing_owner(&definitions, reference.range))
                     .map(str::to_owned)
                     .or_else(|| file_nodes.get(&reference.range.file_id).cloned())
                     .unwrap()
@@ -2321,6 +2327,31 @@ fn build_shards(
     }
     result.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(BuiltShards { shards: result, node_owners: id_sources })
+}
+
+fn decorated_owner<'a>(
+    snap: &GlobalStateSnapshot,
+    definitions: &'a [(usize, FileRange, &'a str)],
+    occurrence: FileRange,
+) -> anyhow::Result<Option<&'a str>> {
+    let file = snap.analysis.parse(occurrence.file_id)?;
+    let Some(item_range) = file
+        .syntax()
+        .covering_element(occurrence.range)
+        .ancestors()
+        .find_map(ast::Attr::cast)
+        .and_then(|attribute| attribute.syntax().parent())
+        .map(|item| item.text_range())
+    else {
+        return Ok(None);
+    };
+    Ok(definitions
+        .iter()
+        .filter(|(_, body, _)| {
+            body.file_id == occurrence.file_id && item_range.contains_range(body.range)
+        })
+        .max_by_key(|(_, body, _)| body.range.len())
+        .map(|(_, _, id)| *id))
 }
 
 fn enclosing_owner<'a>(
