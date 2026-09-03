@@ -1644,6 +1644,7 @@ fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse>
             "workspace-descriptor-sha256={}",
             digest_bytes(workspace.graph_semantic_descriptor().as_bytes())
         ));
+        configurations.extend(workspace.graph_build_script_configurations());
         configurations.extend(workspace.graph_project_inputs.iter().map(|(path, bytes)| {
             format!(
                 "project-input={};sha256={}",
@@ -1930,8 +1931,11 @@ fn build_shards(
                 .map(|definition| source_path(snap, definition.file_id))
                 .unwrap_or_else(|| dependency_source.clone())
         };
-        let owner_source =
-            id_sources.get(&token.stable_id).cloned().or(definition_source).or_else(|| {
+        let owner_source = id_sources
+            .get(&token.stable_id)
+            .cloned()
+            .or_else(|| definition_source.filter(|source| shards.contains_key(source)))
+            .or_else(|| {
                 token
                     .references
                     .iter()
@@ -1956,11 +1960,12 @@ fn build_shards(
                 .then(|| definition.and_then(|range| evidence(snap, range).ok()))
                 .flatten(),
         });
-        if let (Some(node), Some(source)) = (node.as_ref(), owner_source.as_ref()) {
-            id_sources.entry(node.id.clone()).or_insert_with(|| source.clone());
-            if let Some(shard) = shards.get_mut(source) {
-                shard.nodes.push(node.clone());
-            }
+        if let (Some(node), Some(source)) = (node.as_ref(), owner_source.as_ref())
+            && !id_sources.contains_key(&node.id)
+            && let Some(shard) = shards.get_mut(source)
+        {
+            shard.nodes.push(node.clone());
+            id_sources.insert(node.id.clone(), source.clone());
         }
         node_present.push(id_sources.contains_key(&token.stable_id));
         node_sources.push(owner_source);
@@ -1988,6 +1993,9 @@ fn build_shards(
         .iter()
         .enumerate()
         .filter_map(|(token_id, token)| {
+            if !node_present[token_id] {
+                return None;
+            }
             token
                 .definition_body
                 .filter(|body| sources.contains_key(&body.file_id))
@@ -2052,7 +2060,13 @@ fn build_shards(
             let owner = if reference.role == StaticReferenceRole::Export {
                 file_nodes.get(&reference.range.file_id).cloned().unwrap()
             } else {
-                enclosing_owner(&definitions, reference.range)
+                let attribute_owner = if reference.role == StaticReferenceRole::Decorate {
+                    decorated_owner(snap, &definitions, reference.range)?
+                } else {
+                    None
+                };
+                attribute_owner
+                    .or_else(|| enclosing_owner(&definitions, reference.range))
                     .map(str::to_owned)
                     .or_else(|| file_nodes.get(&reference.range.file_id).cloned())
                     .unwrap()
@@ -2083,20 +2097,22 @@ fn build_shards(
             let target_source = (!relation.to_external)
                 .then(|| relation.to_definition_file.map(|file_id| source_path(snap, file_id)))
                 .flatten();
-            let owner_source = target_source.clone().unwrap_or_else(|| source.clone());
-            if let Some(shard) = shards.get_mut(&owner_source) {
-                shard.nodes.push(GraphSnapshotNode {
-                    id: relation.to.clone(),
-                    kind: graph_node_kind(relation.to_kind).to_owned(),
-                    name,
-                    qualified_name: relation.to_qualified_name.clone(),
-                    file: target_source.clone().unwrap_or_else(|| dependency_source.clone()),
-                    external: relation.to_external || target_source.is_none(),
-                    exported: relation.to_exported,
-                    signature: Some(relation.to_signature.clone()),
-                    evidence: None,
-                });
-            }
+            let owner_source = target_source
+                .as_ref()
+                .filter(|target| shards.contains_key(*target))
+                .cloned()
+                .unwrap_or_else(|| source.clone());
+            shards.get_mut(&owner_source).unwrap().nodes.push(GraphSnapshotNode {
+                id: relation.to.clone(),
+                kind: graph_node_kind(relation.to_kind).to_owned(),
+                name,
+                qualified_name: relation.to_qualified_name.clone(),
+                file: target_source.clone().unwrap_or_else(|| dependency_source.clone()),
+                external: relation.to_external || target_source.is_none(),
+                exported: relation.to_exported,
+                signature: Some(relation.to_signature.clone()),
+                evidence: None,
+            });
             id_sources.insert(relation.to.clone(), owner_source);
         }
         let kind = match relation.kind {
@@ -2311,6 +2327,31 @@ fn build_shards(
     }
     result.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(BuiltShards { shards: result, node_owners: id_sources })
+}
+
+fn decorated_owner<'a>(
+    snap: &GlobalStateSnapshot,
+    definitions: &'a [(usize, FileRange, &'a str)],
+    occurrence: FileRange,
+) -> anyhow::Result<Option<&'a str>> {
+    let file = snap.analysis.parse(occurrence.file_id)?;
+    let Some(item_range) = file
+        .syntax()
+        .covering_element(occurrence.range)
+        .ancestors()
+        .find_map(ast::Attr::cast)
+        .and_then(|attribute| attribute.syntax().parent())
+        .map(|item| item.text_range())
+    else {
+        return Ok(None);
+    };
+    Ok(definitions
+        .iter()
+        .filter(|(_, body, _)| {
+            body.file_id == occurrence.file_id && item_range.contains_range(body.range)
+        })
+        .max_by_key(|(_, body, _)| body.range.len())
+        .map(|(_, _, id)| *id))
 }
 
 fn enclosing_owner<'a>(

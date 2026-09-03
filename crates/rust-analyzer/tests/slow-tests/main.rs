@@ -20,7 +20,11 @@ mod ratoml;
 mod support;
 mod testdir;
 
-use std::{collections::BTreeMap, path::PathBuf, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    time::Instant,
+};
 
 use ide_db::FxHashMap;
 use lsp_types::{
@@ -38,6 +42,7 @@ use rust_analyzer::lsp::ext::{
     RunnablesRequest,
 };
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use stdx::format_to_acc;
 
 use test_utils::skip_slow_tests;
@@ -320,6 +325,309 @@ pub trait Shared {}
     assert_ne!(dependency_changed.universe.digest, config_recovered.universe.digest);
     assert_eq!(dependency_changed.base_generation, None);
     assert!(!dependency_changed.upserts.is_empty());
+}
+
+#[test]
+fn graph_snapshot_covers_semantic_breadth_and_build_universe() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    const FIXTURE: &str = r#"
+//- /Cargo.toml
+[workspace]
+members = ["fixture-macro"]
+resolver = "2"
+
+[package]
+name = "graph-breadth"
+version = "0.0.0"
+edition = "2024"
+build = "build.rs"
+
+[features]
+default = ["enabled"]
+enabled = []
+
+[dependencies]
+fixture-macro = { path = "fixture-macro" }
+
+//- /build.rs
+fn main() {
+    let out = std::env::var_os("OUT_DIR").unwrap();
+    std::fs::write(
+        std::path::Path::new(&out).join("generated.rs"),
+        "pub fn generated() -> u8 { 7 }\n",
+    )
+    .unwrap();
+    println!("cargo::rustc-cfg=build_script_cfg");
+    println!("cargo::rerun-if-changed=build.rs");
+}
+
+//- /src/lib.rs
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+pub trait Parent { type Item; const VALUE: u8; fn same(&self) -> u8; }
+pub trait Child: Parent { fn child(&self) -> u8; }
+pub trait Other { fn same(&self) -> u8; }
+pub struct Service<T>(pub T);
+impl Service<u8> { pub fn inherent(&self) -> u8 { self.0 } }
+impl Parent for Service<u8> {
+    type Item = u8;
+    const VALUE: u8 = 1;
+    fn same(&self) -> u8 { self.0 }
+}
+impl Child for Service<u8> { fn child(&self) -> u8 { Parent::same(self) } }
+impl Other for Service<u8> { fn same(&self) -> u8 { self.inherent() } }
+
+macro_rules! invoke { ($value:expr) => { $value }; }
+
+use fixture_macro::identity as decorate;
+
+#[decorate]
+pub fn proc_decorated() -> u8 { generated() }
+
+#[cfg(feature = "enabled")]
+pub fn featured() -> u8 { 1 }
+
+#[cfg(build_script_cfg)]
+pub fn built() -> u8 { 2 }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn targeted() -> u8 { 3 }
+
+pub use proc_decorated as exported;
+
+pub fn generic<T: Parent>(value: &T) -> u8 { value.same() }
+
+pub async fn asynchronous(value: Service<u8>) -> u8 {
+    let constructed = Service(1);
+    let closure = || Other::same(&value);
+    invoke!(closure() + Child::child(&value) + constructed.inherent() + exported())
+}
+
+#[test]
+fn generated_is_tested() { assert_eq!(generated(), 7); }
+
+//- /fixture-macro/Cargo.toml
+[package]
+name = "fixture-macro"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+//- /fixture-macro/src/lib.rs
+use proc_macro::TokenStream;
+
+#[proc_macro_attribute]
+pub fn identity(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    if attribute.to_string() == "fail" { panic!("fixture macro failure"); }
+    item
+}
+"#;
+    let server = Project::with_fixture(FIXTURE)
+        .with_config(json!({
+            "cargo": {
+                "buildScripts": { "enable": true },
+                "sysroot": "discover",
+            },
+            "procMacro": { "enable": true },
+        }))
+        .server()
+        .wait_until_workspace_is_loaded();
+    let snapshot = request_graph_snapshot(
+        &server,
+        GraphSnapshotParams::default(),
+        "semantic breadth graph snapshot",
+    );
+    let nodes = snapshot.upserts.iter().flat_map(|shard| &shard.nodes).collect::<Vec<_>>();
+    let edges = snapshot.upserts.iter().flat_map(|shard| &shard.edges).collect::<Vec<_>>();
+    let edge_kinds = edges.iter().map(|edge| edge.kind.as_str()).collect::<BTreeSet<_>>();
+    let names = nodes.iter().map(|node| node.name.as_str()).collect::<BTreeSet<_>>();
+    let same_ids = nodes
+        .iter()
+        .filter(|node| node.name == "same")
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let unique_id = |name: &str| {
+        let ids = nodes
+            .iter()
+            .filter(|node| node.name == name)
+            .map(|node| node.id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 1, "expected one graph identity for {name}: {ids:?}");
+        *ids.first().unwrap()
+    };
+
+    assert_unique_graph_node_ownership(&snapshot.upserts);
+    assert_eq!(snapshot.producer.commit.len(), 40);
+    assert!(snapshot.universe.configurations.iter().any(|row| {
+        row.split(';').any(|part| {
+            part.strip_prefix("features=")
+                .is_some_and(|features| features.split(',').any(|feature| feature == "enabled"))
+        })
+    }));
+    assert!(snapshot.universe.configurations.iter().any(|row| row.contains("build_script_cfg")));
+    assert!(snapshot.universe.configurations.iter().any(|row| row == "proc-macros-loaded=true"));
+    assert!(snapshot.universe.configurations.iter().any(|row| row == "run-build-scripts=true"));
+    assert!(snapshot.universe.configurations.iter().any(|row| row.starts_with("rustc-version=")));
+    assert!(snapshot.universe.configurations.iter().any(|row| row.starts_with("target=")));
+    assert!(names.is_superset(&BTreeSet::from([
+        "Child",
+        "Item",
+        "Other",
+        "Parent",
+        "Service",
+        "VALUE",
+        "asynchronous",
+        "built",
+        "closure",
+        "exported",
+        "featured",
+        "generated",
+        "generic",
+        "identity",
+        "inherent",
+        "proc_decorated",
+        "targeted",
+    ])));
+    assert!(same_ids.len() >= 4, "same-named trait and impl methods were conflated");
+    for kind in [
+        "accesses",
+        "calls",
+        "decorates",
+        "exports",
+        "extends",
+        "implements",
+        "imports",
+        "instantiates",
+        "overrides",
+        "references",
+        "tests",
+        "type_ref",
+    ] {
+        assert!(edge_kinds.contains(kind), "semantic breadth fixture omitted {kind}");
+    }
+    assert!(edge_kinds.contains("contains"));
+    let asynchronous = unique_id("asynchronous");
+    let closure = unique_id("closure");
+    let generated = unique_id("generated");
+    let generated_test = unique_id("generated_is_tested");
+    let generic = unique_id("generic");
+    let identity = unique_id("identity");
+    let inherent = unique_id("inherent");
+    let proc_decorated = unique_id("proc_decorated");
+    let exported = unique_id("exported");
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "contains" && edge.from == asynchronous && edge.to == closure
+    }));
+    assert!(
+        edges.iter().any(|edge| {
+            edge.kind == "calls" && edge.from == asynchronous && edge.to == inherent
+        })
+    );
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "calls" && edge.from == closure && same_ids.contains(edge.to.as_str())
+    }));
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "calls" && edge.from == generic && same_ids.contains(edge.to.as_str())
+    }));
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "decorates" && edge.from == proc_decorated && edge.to == identity
+    }));
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "references" && edge.from == exported && edge.to == proc_decorated
+    }));
+    assert!(edges.iter().any(|edge| {
+        edge.kind == "tests" && edge.from == generated_test && edge.to == generated
+    }));
+    assert!(nodes.iter().filter(|node| node.name == "generated").all(|node| {
+        node.evidence.as_ref().is_some_and(|evidence| evidence.file == "src/lib.rs")
+    }));
+    let expected_coverage = BTreeMap::from([
+        ("accesses", "partial"),
+        ("calls", "partial"),
+        ("contains", "partial"),
+        ("decorates", "partial"),
+        ("dispatches", "partial"),
+        ("exports", "partial"),
+        ("extends", "partial"),
+        ("implements", "partial"),
+        ("imports", "partial"),
+        ("instantiates", "partial"),
+        ("overrides", "partial"),
+        ("references", "partial"),
+        ("renders", "unsupported"),
+        ("tests", "partial"),
+        ("type_ref", "partial"),
+    ]);
+    assert!(snapshot.upserts.iter().all(|shard| {
+        shard.coverage.len() == expected_coverage.len()
+            && shard
+                .coverage
+                .iter()
+                .map(|row| (row.family.as_str(), row.state.as_str()))
+                .collect::<BTreeMap<_, _>>()
+                == expected_coverage
+    }));
+    assert!(
+        snapshot
+            .upserts
+            .iter()
+            .flat_map(|shard| &shard.unresolved)
+            .any(|row| { row.family == "dispatches" && row.reason == "dynamic" })
+    );
+
+    let healthy_source = std::fs::read_to_string(server.path().join("src/lib.rs")).unwrap();
+    let healthy_digest = format!("{:x}", Sha256::digest(healthy_source.as_bytes()));
+    let healthy_shard = snapshot.upserts.iter().find(|shard| shard.source == "src/lib.rs").unwrap();
+    assert_eq!(healthy_shard.checker_digest, healthy_digest);
+    let healthy_shard_digest = healthy_shard.digest.clone();
+    let failed_source = healthy_source.replacen("#[decorate]", "#[decorate(fail)]", 1);
+    let failed_digest = format!("{:x}", Sha256::digest(failed_source.as_bytes()));
+    server.open_file_with_text("src/lib.rs", failed_source);
+    let macro_failed = request_graph_snapshot(
+        &server,
+        GraphSnapshotParams {
+            known_generation: Some(snapshot.generation.clone()),
+            checkpoint: None,
+        },
+        "proc-macro failure graph snapshot",
+    );
+    assert_eq!(macro_failed.base_generation.as_deref(), Some(snapshot.generation.as_str()));
+    let failed_shard = macro_failed
+        .upserts
+        .iter()
+        .find(|shard| shard.source == "src/lib.rs")
+        .expect("proc-macro failure did not publish its changed source shard");
+    assert_eq!(failed_shard.checker_digest, failed_digest);
+    assert!(failed_shard.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "macro-error"
+            && diagnostic.message.contains("fixture macro failure")
+            && diagnostic.severity.as_deref() == Some("error")
+    }));
+
+    server.change_file_with_text("src/lib.rs", 2, healthy_source);
+    let macro_recovered = request_graph_snapshot(
+        &server,
+        GraphSnapshotParams {
+            known_generation: Some(macro_failed.generation.clone()),
+            checkpoint: None,
+        },
+        "proc-macro recovery graph snapshot",
+    );
+    assert_eq!(macro_recovered.base_generation.as_deref(), Some(macro_failed.generation.as_str()));
+    assert_eq!(macro_recovered.generation, snapshot.generation);
+    let recovered_shard = macro_recovered
+        .upserts
+        .iter()
+        .find(|shard| shard.source == "src/lib.rs")
+        .expect("proc-macro recovery did not publish its restored source shard");
+    assert_eq!(recovered_shard.checker_digest, healthy_digest);
+    assert_eq!(recovered_shard.digest, healthy_shard_digest);
+    assert!(recovered_shard.diagnostics.iter().all(|diagnostic| diagnostic.code != "macro-error"));
 }
 
 fn request_graph_snapshot(

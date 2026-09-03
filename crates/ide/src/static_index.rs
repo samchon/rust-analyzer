@@ -928,7 +928,11 @@ impl<'a> StaticIndex<'a> {
                     }),
                     definition_body: nav.as_ref().map(|it| FileRange {
                         file_id: it.file_id,
-                        range: definition_range_excluding_trivia(&sema, it.file_id, it.full_range),
+                        range: if graph {
+                            graph_definition_body_range(def, scope_node, range, it.full_range)
+                        } else {
+                            definition_range_excluding_trivia(&sema, it.file_id, it.full_range)
+                        },
                     }),
                     references: vec![],
                     moniker,
@@ -1168,6 +1172,80 @@ fn is_leading_trivia_excluding_docs(token: &SyntaxToken) -> bool {
     }
 }
 
+fn graph_definition_body_range(
+    def: Definition<'_>,
+    scope_node: &SyntaxNode,
+    binding: TextRange,
+    fallback: TextRange,
+) -> TextRange {
+    let closure = matches!(def, Definition::Local(_))
+        .then(|| scope_node.ancestors().find_map(ast::LetStmt::cast))
+        .flatten()
+        .and_then(|statement| {
+            closure_bound_to_range(statement.pat()?, statement.initializer()?, binding)
+        });
+    closure.map(|closure| closure.syntax().text_range()).unwrap_or(fallback)
+}
+
+fn closure_bound_to_range(
+    pattern: ast::Pat,
+    expression: ast::Expr,
+    binding: TextRange,
+) -> Option<ast::ClosureExpr> {
+    match (pattern, expression) {
+        (pattern, ast::Expr::ParenExpr(expression)) => {
+            closure_bound_to_range(pattern, expression.expr()?, binding)
+        }
+        (ast::Pat::IdentPat(pattern), expression) => match expression {
+            ast::Expr::ClosureExpr(closure) => pattern
+                .name()
+                .is_some_and(|name| name.syntax().text_range().contains_range(binding))
+                .then_some(closure),
+            expression => closure_bound_to_range(pattern.pat()?, expression, binding),
+        },
+        (ast::Pat::ParenPat(pattern), expression) => {
+            closure_bound_to_range(pattern.pat()?, expression, binding)
+        }
+        (ast::Pat::TuplePat(pattern), ast::Expr::TupleExpr(expression)) => {
+            closure_bound_in_tuple(pattern, expression, binding)
+        }
+        _ => None,
+    }
+}
+
+fn closure_bound_in_tuple(
+    pattern: ast::TuplePat,
+    expression: ast::TupleExpr,
+    binding: TextRange,
+) -> Option<ast::ClosureExpr> {
+    let patterns = pattern.fields().collect::<Vec<_>>();
+    let expressions = expression.fields().collect::<Vec<_>>();
+    let rest = patterns.iter().position(|pattern| matches!(pattern, ast::Pat::RestPat(_)));
+    let Some(rest) = rest else {
+        if patterns.len() != expressions.len() {
+            return None;
+        }
+        return patterns.into_iter().zip(expressions).find_map(|(pattern, expression)| {
+            closure_bound_to_range(pattern, expression, binding)
+        });
+    };
+    let suffix = patterns.len() - rest - 1;
+    if expressions.len() < rest + suffix {
+        return None;
+    }
+    patterns[..rest]
+        .iter()
+        .cloned()
+        .zip(expressions[..rest].iter().cloned())
+        .chain(
+            patterns[rest + 1..]
+                .iter()
+                .cloned()
+                .zip(expressions[expressions.len() - suffix..].iter().cloned()),
+        )
+        .find_map(|(pattern, expression)| closure_bound_to_range(pattern, expression, binding))
+}
+
 fn is_trailing_trivia(token: &SyntaxToken) -> bool {
     matches!(token.kind(), SyntaxKind::WHITESPACE | SyntaxKind::COMMENT)
 }
@@ -1178,9 +1256,9 @@ mod tests {
 
     use crate::{StaticIndex, fixture};
     use ide_db::{FileRange, FxHashMap, FxHashSet, base_db::VfsPath};
-    use syntax::TextSize;
+    use syntax::{AstNode, TextSize, ast};
 
-    use super::{StaticRelationKind, VendoredLibrariesConfig};
+    use super::{StaticReferenceRole, StaticRelationKind, VendoredLibrariesConfig};
 
     fn graph_identities(ra_fixture: &str) -> Vec<(Option<String>, String)> {
         let (analysis, _) = fixture::annotations_without_marker(ra_fixture);
@@ -1895,5 +1973,154 @@ pub fn run() { invoke!(Service.render()); }
         }
         assert!(service_is_constructed);
         assert!(render_is_called);
+    }
+
+    #[test]
+    fn graph_covers_trait_generic_async_and_macro_semantics() {
+        let (analysis, _) = fixture::annotations_without_marker(
+            r#"
+//- minicore: async_fn
+//- /workspace/lib.rs crate:main
+pub trait Parent { type Item; const VALUE: u8; fn same(&self) -> u8; }
+pub trait Child: Parent { fn child(&self) -> u8; }
+pub trait Other { fn same(&self) -> u8; }
+pub struct Service<T>(pub T);
+impl Service<u8> { pub fn inherent(&self) -> u8 { self.0 } }
+impl Parent for Service<u8> {
+    type Item = u8;
+    const VALUE: u8 = 1;
+    fn same(&self) -> u8 { self.0 }
+}
+impl Child for Service<u8> { fn child(&self) -> u8 { Parent::same(self) } }
+impl Other for Service<u8> { fn same(&self) -> u8 { self.inherent() } }
+macro_rules! invoke { ($value:expr) => { $value }; }
+pub fn generic<T: Parent>(value: &T) -> u8 { value.same() }
+pub async fn asynchronous(value: Service<u8>) -> u8 {
+    let constructed = Service(1);
+    let closure = || Other::same(&value);
+    let (nested,) = ((|arg: u8| Other::same(&value) + arg),);
+    let ref outer @ ref inner = || Parent::same(&value);
+    let (first, .., last) = (
+        || Parent::same(&value),
+        || 1,
+        || 2,
+        || Other::same(&value),
+    );
+    let wrapper @ (wrapped_first, wrapped_last) =
+        (|| Parent::same(&value), || Other::same(&value));
+    let (parenthesized) = (|| Other::same(&value));
+    invoke!(closure() + nested(1) + Child::child(&value) + constructed.inherent())
+}
+"#,
+        );
+        let index = StaticIndex::compute_graph(&analysis, VendoredLibrariesConfig::Excluded);
+        let relation_kinds =
+            index.relations.iter().map(|relation| relation.kind).collect::<BTreeSet<_>>();
+        let tokens = index.tokens.iter().map(|(_, token)| token).collect::<Vec<_>>();
+        let same_ids = tokens
+            .iter()
+            .filter(|token| token.display_name.as_deref() == Some("same"))
+            .map(|token| token.stable_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let names = tokens
+            .iter()
+            .filter_map(|token| token.display_name.as_deref())
+            .collect::<BTreeSet<_>>();
+        let roles = tokens
+            .iter()
+            .flat_map(|token| token.references.iter().map(|reference| reference.role))
+            .collect::<Vec<_>>();
+        let roles_for = |name: &str| {
+            tokens
+                .iter()
+                .filter(|token| token.display_name.as_deref() == Some(name))
+                .flat_map(|token| token.references.iter().map(|reference| reference.role))
+                .collect::<Vec<_>>()
+        };
+
+        assert!(relation_kinds.contains(&StaticRelationKind::Extends));
+        assert!(relation_kinds.contains(&StaticRelationKind::Implements));
+        assert!(relation_kinds.contains(&StaticRelationKind::Overrides));
+        assert!(same_ids.len() >= 4, "same-named trait and impl methods were conflated");
+        assert!(names.is_superset(&BTreeSet::from([
+            "Item",
+            "VALUE",
+            "asynchronous",
+            "child",
+            "closure",
+            "generic",
+            "inherent",
+        ])));
+        assert!(roles.contains(&StaticReferenceRole::Access));
+        assert!(roles.contains(&StaticReferenceRole::Call));
+        assert!(roles.contains(&StaticReferenceRole::Instantiate));
+        assert!(roles.contains(&StaticReferenceRole::Type));
+        assert!(roles_for("Service").contains(&StaticReferenceRole::Instantiate));
+        assert!(roles_for("inherent").contains(&StaticReferenceRole::Call));
+        assert!(roles_for("same").contains(&StaticReferenceRole::Call));
+        let closure =
+            tokens.iter().find(|token| token.display_name.as_deref() == Some("closure")).unwrap();
+        assert!(
+            closure.definition_body.unwrap().range.len() > closure.definition.unwrap().range.len()
+        );
+        let nested =
+            tokens.iter().find(|token| token.display_name.as_deref() == Some("nested")).unwrap();
+        let argument =
+            tokens.iter().find(|token| token.display_name.as_deref() == Some("arg")).unwrap();
+        assert!(
+            nested.definition_body.unwrap().range.len() > nested.definition.unwrap().range.len()
+        );
+        assert_eq!(argument.definition_body, argument.definition);
+        let local = |name: &str| {
+            tokens.iter().find(|token| token.display_name.as_deref() == Some(name)).unwrap()
+        };
+        let outer = local("outer");
+        let inner = local("inner");
+        let first = local("first");
+        let last = local("last");
+        let wrapped_first = local("wrapped_first");
+        let wrapped_last = local("wrapped_last");
+        let wrapper = local("wrapper");
+        let parenthesized = local("parenthesized");
+        assert!(outer.definition_body.unwrap().range.len() > outer.definition.unwrap().range.len());
+        assert!(
+            inner.definition_body.unwrap().range.len() < outer.definition_body.unwrap().range.len()
+        );
+        assert!(
+            first.definition_body.unwrap().range.start()
+                < last.definition_body.unwrap().range.start()
+        );
+        let last_body = last.definition_body.unwrap();
+        let last_owns_same = tokens
+            .iter()
+            .filter(|token| token.display_name.as_deref() == Some("same"))
+            .flat_map(|token| &token.references)
+            .any(|reference| {
+                reference.range.file_id == last_body.file_id
+                    && last_body.range.contains_range(reference.range.range)
+            });
+        assert!(last_owns_same);
+        assert!(
+            wrapped_first.definition_body.unwrap().range.len()
+                > wrapped_first.definition.unwrap().range.len()
+        );
+        assert!(
+            wrapped_last.definition_body.unwrap().range.len()
+                > wrapped_last.definition.unwrap().range.len()
+        );
+        let wrapper_body = wrapper.definition_body.unwrap();
+        let wrapper_pattern = analysis
+            .parse(wrapper_body.file_id)
+            .unwrap()
+            .syntax()
+            .descendants()
+            .filter_map(ast::IdentPat::cast)
+            .find(|pattern| pattern.syntax().text().to_string().starts_with("wrapper @"))
+            .unwrap();
+        assert_eq!(wrapper_body.range, wrapper_pattern.syntax().text_range());
+        assert!(
+            parenthesized.definition_body.unwrap().range.len()
+                > parenthesized.definition.unwrap().range.len()
+        );
     }
 }

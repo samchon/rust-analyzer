@@ -842,6 +842,37 @@ impl ProjectWorkspace {
         }
     }
 
+    /// Explicit build-script cfgs that participate in the HIR crate universe.
+    ///
+    /// Environment values remain represented only by the complete project-model
+    /// descriptor digest; publishing them here could disclose project secrets.
+    pub fn graph_build_script_configurations(&self) -> Vec<String> {
+        let mut configurations = Vec::new();
+        let mut extend = |cargo: &CargoWorkspace, build_scripts: &WorkspaceBuildScripts| {
+            for package in cargo.packages() {
+                let Some(output) = build_scripts.get_output(package) else {
+                    continue;
+                };
+                configurations.extend(output.cfgs.iter().map(|cfg| {
+                    format!("build-script-cfg={cfg:?};package-id={}", cargo[package].id)
+                }));
+            }
+        };
+        match &self.kind {
+            ProjectWorkspaceKind::Cargo { cargo, build_scripts, .. } => {
+                extend(cargo, build_scripts)
+            }
+            ProjectWorkspaceKind::DetachedFile {
+                cargo: Some((cargo, build_scripts, _)),
+                ..
+            } => extend(cargo, build_scripts),
+            ProjectWorkspaceKind::Json(_)
+            | ProjectWorkspaceKind::DetachedFile { cargo: None, .. } => {}
+        }
+        configurations.sort();
+        configurations.dedup();
+        configurations
+    }
     pub fn manifest(&self) -> Option<&ManifestPath> {
         match &self.kind {
             ProjectWorkspaceKind::Cargo { cargo, .. } => Some(cargo.manifest_path()),
