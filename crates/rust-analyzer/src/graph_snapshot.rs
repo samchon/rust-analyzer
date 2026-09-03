@@ -1644,6 +1644,7 @@ fn universe(snap: &GlobalStateSnapshot) -> anyhow::Result<GraphSnapshotUniverse>
             "workspace-descriptor-sha256={}",
             digest_bytes(workspace.graph_semantic_descriptor().as_bytes())
         ));
+        configurations.extend(workspace.graph_build_script_configurations());
         configurations.extend(workspace.graph_project_inputs.iter().map(|(path, bytes)| {
             format!(
                 "project-input={};sha256={}",
