@@ -2096,16 +2096,16 @@ fn build_shards(
                 .cloned()
                 .unwrap_or_else(|| source.clone());
             shards.get_mut(&owner_source).unwrap().nodes.push(GraphSnapshotNode {
-                    id: relation.to.clone(),
-                    kind: graph_node_kind(relation.to_kind).to_owned(),
-                    name,
-                    qualified_name: relation.to_qualified_name.clone(),
-                    file: target_source.clone().unwrap_or_else(|| dependency_source.clone()),
-                    external: relation.to_external || target_source.is_none(),
-                    exported: relation.to_exported,
-                    signature: Some(relation.to_signature.clone()),
-                    evidence: None,
-                });
+                id: relation.to.clone(),
+                kind: graph_node_kind(relation.to_kind).to_owned(),
+                name,
+                qualified_name: relation.to_qualified_name.clone(),
+                file: target_source.clone().unwrap_or_else(|| dependency_source.clone()),
+                external: relation.to_external || target_source.is_none(),
+                exported: relation.to_exported,
+                signature: Some(relation.to_signature.clone()),
+                evidence: None,
+            });
             id_sources.insert(relation.to.clone(), owner_source);
         }
         let kind = match relation.kind {
