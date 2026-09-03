@@ -1930,8 +1930,11 @@ fn build_shards(
                 .map(|definition| source_path(snap, definition.file_id))
                 .unwrap_or_else(|| dependency_source.clone())
         };
-        let owner_source =
-            id_sources.get(&token.stable_id).cloned().or(definition_source).or_else(|| {
+        let owner_source = id_sources
+            .get(&token.stable_id)
+            .cloned()
+            .or_else(|| definition_source.filter(|source| shards.contains_key(source)))
+            .or_else(|| {
                 token
                     .references
                     .iter()
@@ -1956,11 +1959,12 @@ fn build_shards(
                 .then(|| definition.and_then(|range| evidence(snap, range).ok()))
                 .flatten(),
         });
-        if let (Some(node), Some(source)) = (node.as_ref(), owner_source.as_ref()) {
-            id_sources.entry(node.id.clone()).or_insert_with(|| source.clone());
-            if let Some(shard) = shards.get_mut(source) {
-                shard.nodes.push(node.clone());
-            }
+        if let (Some(node), Some(source)) = (node.as_ref(), owner_source.as_ref())
+            && !id_sources.contains_key(&node.id)
+            && let Some(shard) = shards.get_mut(source)
+        {
+            shard.nodes.push(node.clone());
+            id_sources.insert(node.id.clone(), source.clone());
         }
         node_present.push(id_sources.contains_key(&token.stable_id));
         node_sources.push(owner_source);
@@ -1988,6 +1992,9 @@ fn build_shards(
         .iter()
         .enumerate()
         .filter_map(|(token_id, token)| {
+            if !node_present[token_id] {
+                return None;
+            }
             token
                 .definition_body
                 .filter(|body| sources.contains_key(&body.file_id))
@@ -2083,9 +2090,12 @@ fn build_shards(
             let target_source = (!relation.to_external)
                 .then(|| relation.to_definition_file.map(|file_id| source_path(snap, file_id)))
                 .flatten();
-            let owner_source = target_source.clone().unwrap_or_else(|| source.clone());
-            if let Some(shard) = shards.get_mut(&owner_source) {
-                shard.nodes.push(GraphSnapshotNode {
+            let owner_source = target_source
+                .as_ref()
+                .filter(|target| shards.contains_key(*target))
+                .cloned()
+                .unwrap_or_else(|| source.clone());
+            shards.get_mut(&owner_source).unwrap().nodes.push(GraphSnapshotNode {
                     id: relation.to.clone(),
                     kind: graph_node_kind(relation.to_kind).to_owned(),
                     name,
@@ -2096,7 +2106,6 @@ fn build_shards(
                     signature: Some(relation.to_signature.clone()),
                     evidence: None,
                 });
-            }
             id_sources.insert(relation.to.clone(), owner_source);
         }
         let kind = match relation.kind {
