@@ -463,7 +463,12 @@ pub fn identity(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
     assert_unique_graph_node_ownership(&snapshot.upserts);
     assert_eq!(snapshot.producer.commit.len(), 40);
-    assert!(snapshot.universe.configurations.iter().any(|row| row.contains("features=enabled")));
+    assert!(snapshot.universe.configurations.iter().any(|row| {
+        row.split(';').any(|part| {
+            part.strip_prefix("features=")
+                .is_some_and(|features| features.split(',').any(|feature| feature == "enabled"))
+        })
+    }));
     assert!(snapshot.universe.configurations.iter().any(|row| row.contains("build_script_cfg")));
     assert!(snapshot.universe.configurations.iter().any(|row| row == "proc-macros-loaded=true"));
     assert!(snapshot.universe.configurations.iter().any(|row| row == "run-build-scripts=true"));
